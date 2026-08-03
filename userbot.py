@@ -290,17 +290,18 @@ def _role_prompt_suffix(peer: Any) -> str:
     kind = role.get("role")
     if kind == "mom":
         return (
-            " ВАЖНО: это твоя МАМА. ВСЕГДА отвечай СТРОГО на узбекском языке, "
-            "уважительно, на «Siz», в роли заботливого сына. Никогда не обращайся "
-            "к ней «сынок», «дочка», «детка»."
+            " ВАЖНО: это твоя МАМА — роль назначена. Ты отвечаешь от лица СЫНА. "
+            "ВСЕГДА отвечай СТРОГО на узбекском языке, уважительно, на «Siz», "
+            "обращаясь «Ойи/Мама». Не начинай каждое сообщение с обращения — "
+            "обращайся редко и естественно."
         )
     if kind == "dad":
         return (
-            " ВАЖНО: это твой ПАПА. Определи язык его сообщения: если он написал "
-            "по-русски — отвечай по-русски; если по-узбекски — по-узбекски. "
-            "Отвечай в роли уважительного сына («Да, пап», «Хорошо, сделаю»), "
-            "обращайся «пап» / «ада» / «отта» в зависимости от языка. Никогда не "
-            "обращайся к нему «сынок», «дочка», «детка»."
+            " ВАЖНО: это твой ПАПА — роль назначена. Ты отвечаешь от лица СЫНА. "
+            "Обращайся «Папа/Пап» (или «ада/отта» на узбекском) с сыновьим "
+            "уважением, сохраняя язык его сообщения: написал по-русски — отвечай "
+            "по-русски, по-узбекски — по-узбекски. Не начинай каждое сообщение с "
+            "обращения — обращайся редко и естественно («Да, пап», «Хорошо, сделаю»)."
         )
     if kind == "custom":
         instr = (role.get("instruction") or "").strip()
@@ -400,10 +401,12 @@ def _internet_prompt_suffix(peer: Any) -> str:
             " У тебя ВКЛЮЧЁН доступ к поиску в интернете для этого собеседника. "
             "Если он задаёт вопрос, требующий свежих данных (что такое X, погода, "
             "новости, курсы, цены, как работает и т.п.), используй предоставленные "
-            "в сообщении результаты поиска и отвечай точно, просто и понятно, БЕЗ "
-            "выдумок. Если результаты НЕ предоставлены — значит поиск не дал "
-            "результатов: честно скажи, что не смог найти актуальную информацию, и "
-            "предложи повторить позже. Для обычных бытовых сообщений поиск не нужен "
+            "в сообщении результаты поиска и сразу отвечай готовым ответом с "
+            "фактами, точно, просто и понятно, БЕЗ выдумок. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО "
+            "писать обещания-пустышки («Я сейчас поищу», «Давай, пап!» и т.п.) без "
+            "самой информации. Если результаты НЕ предоставлены — значит поиск не "
+            "дал результатов: честно скажи, что не смог найти актуальную информацию, "
+            "и предложи повторить позже. Для обычных бытовых сообщений поиск не нужен "
             "— отвечай как обычно."
         )
     return (
@@ -574,6 +577,31 @@ async def _web_search_context(peer: Any, text: str) -> str:
 
 _load_user_roles()
 
+# --- Контекст диалога: последние сообщения с каждым собеседником ---
+# peer_id -> [(role, text)], role: "peer" | "me"
+DIALOG_HISTORY: dict[Any, list[tuple[str, str]]] = {}
+HISTORY_LIMIT = 10  # храним не больше 10 записей, в промпт уходят последние 3-5
+
+
+def _push_dialog(peer_id: Any, role: str, text: str) -> None:
+    """Добавляет сообщение в историю переписки с собеседником."""
+    if not text:
+        return
+    hist = DIALOG_HISTORY.setdefault(peer_id, [])
+    hist.append((role, str(text)[:500]))
+    del hist[:-HISTORY_LIMIT]
+
+
+def _dialog_history_block(peer_id: Any, limit: int = 5) -> str:
+    """Форматирует последние N сообщений диалога для подстановки в промпт."""
+    hist = DIALOG_HISTORY.get(peer_id) or []
+    lines = []
+    for role, text in hist[-limit:]:
+        marker = "Собеседник" if role == "peer" else "Ты (владелец)"
+        lines.append(f"{marker}: {text}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
@@ -605,13 +633,20 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 BASE_ROLE_RULES = (
     "Ты выступаешь от лица владельца аккаунта — это СЫН / молодой человек. "
-    "Твой собеседник — это ТВОЙ Папа, Твоя Мама, друг или группа. "
-    "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО обращаться к собеседнику «сынок», «дочка», «детка» "
-    "и любыми подобными обращениями: ты сын, а не родитель. "
-    "Если собеседник — Папа, обращайся к нему «пап» / «ада» / «отта» (в зависимости "
-    "от языка сообщения) с сыновьим уважением. "
-    "Если собеседник — Мама, обращайся к ней «мам» / «ойижон» / «оян» (в зависимости "
-    "от языка сообщения) с любовью и уважением. "
+    "Твой собеседник — брат, друг, ровесник или обычный контакт, ЕСЛИ для него "
+    "не назначена специальная роль (папа / мама). "
+    "Если у собеседника нет роли папы или мамы, общайся с ним естественно и "
+    "дружелюбно, как ровесник с ровесником. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО обращаться "
+    "к собеседнику «пап», «сын», «мам», «сынок», «дочка», «детка» и любыми "
+    "подобными словами, если роль не назначена. "
+    "Не вставляй имя собеседника в каждое сообщение: пиши его только когда это "
+    "уместно по смыслу или владелец явно попросил. "
+    "Если собеседник — Папа, ты отвечаешь от лица СЫНА и обращаешься «Папа/Пап» "
+    "(или «ада/отта» в зависимости от языка) с сыновьим уважением. "
+    "Если собеседник — Мама, ты отвечаешь от лица СЫНА и обращаешься уважительно "
+    "«Ойи/Мама» строго на узбекском языке. "
+    "Не начинай каждое сообщение с обращения к родителям — обращайся редко и "
+    "естественно. "
 )
 
 AI_SYSTEM_PROMPT = (
@@ -644,11 +679,16 @@ GEMINI_SAFETY = [
 ]
 
 
-def _build_user_prompt(text: str, peer_name: str, web_context: str = "") -> str:
-    body = (
-        f"Собеседник: {peer_name or 'Незнакомец'}\n"
-        f"Сообщение: {text}"
-    )
+def _build_user_prompt(
+    text: str, peer_name: str, web_context: str = "", history: str = "", username: str = ""
+) -> str:
+    who = peer_name or "Незнакомец"
+    if username:
+        who += f" (username: @{username})"
+    body = f"Собеседник: {who}"
+    if history:
+        body += f"\n\nИстория переписки с ним (последние сообщения, для контекста):\n{history}"
+    body += f"\n\nТекущее сообщение собеседника:\n{text}"
     if web_context:
         body += (
             "\n\nРезультаты поиска в интернете (используй их для точного ответа, "
@@ -768,16 +808,24 @@ async def _generate_with_fallback(system_prompt: str, user_prompt: str) -> Optio
 
 
 async def generate_suggestions(
-    text: str, peer_name: str, role_suffix: str = "", web_context: str = ""
+    text: str,
+    peer_name: str,
+    role_suffix: str = "",
+    web_context: str = "",
+    history: str = "",
+    username: str = "",
 ) -> list[str]:
     """Генерирует варианты ответа напрямую: Gemini, при лимитах — Groq.
 
     role_suffix — дополнительные правила промпта по роли собеседника
     (мама/папа/кастомная из /role) и флагу интернет-поиска.
     web_context — свежие результаты поиска, если /inter включён для собеседника.
+    history — последние сообщения диалога (контекст для коротких реплик).
+    username — @username собеседника (пассивное знание, без спама обращением).
     """
     raw = await _generate_with_fallback(
-        AI_SYSTEM_PROMPT + role_suffix, _build_user_prompt(text, peer_name, web_context)
+        AI_SYSTEM_PROMPT + role_suffix,
+        _build_user_prompt(text, peer_name, web_context, history, username),
     )
     suggestions = _parse_suggestions(raw) if raw else []
     logger.info("Сгенерировано вариантов ответа: %s", len(suggestions))
@@ -862,8 +910,12 @@ async def handle_incoming(message: Message) -> None:
     # Роль собеседника (папа/мама/кастомная) + правило интернет-поиска
     role_suffix = _role_prompt_suffix(peer) + _internet_prompt_suffix(peer)
     web_context = await _web_search_context(peer, payload["text"])
+    # История диалога (без текущего сообщения) для коротких реплик
+    history = _dialog_history_block(peer.id)
+    _push_dialog(peer.id, "peer", payload["text"])
     payload["role_suffix"] = role_suffix
     payload["web_context"] = web_context
+    payload["history"] = history
     logger.info(
         "Получено ЛС от %s (%s): %s",
         payload["peer_id"],
@@ -877,7 +929,12 @@ async def handle_incoming(message: Message) -> None:
         return
 
     suggestions = await generate_suggestions(
-        payload["text"], payload["peer_name"], role_suffix, web_context
+        payload["text"],
+        payload["peer_name"],
+        role_suffix,
+        web_context,
+        history,
+        payload["peer_username"],
     )
 
     if not suggestions:
@@ -917,6 +974,8 @@ async def handle_auto_reply(payload: dict[str, Any]) -> None:
         payload["peer_name"],
         payload.get("role_suffix") or "",
         payload.get("web_context") or "",
+        payload.get("history") or "",
+        payload.get("peer_username") or "",
     )
     if not variants:
         await notify_owner(
@@ -933,6 +992,7 @@ async def handle_auto_reply(payload: dict[str, Any]) -> None:
         logger.exception("Не удалось отправить авто-ответ для %s", ref)
         await notify_owner(f"⚠️ Не удалось отправить авто-ответ для {ref}: {exc}")
         return
+    _push_dialog(payload["peer_id"], "me", answer)
     logger.info("Авто-ответ отправлен для %s", ref)
     await notify_owner(f"🤖 Авто-ответ отправлен для {ref}: {answer}")
 
@@ -1141,6 +1201,7 @@ async def handle_callback(cb: CallbackQuery) -> None:
             logger.exception("Не удалось отправить ответ собеседнику id=%s", peer_id)
             await _safe_answer(cb, "⚠️ Не удалось отправить (проверьте доступ)")
             return
+        _push_dialog(peer_id, "me", variant)
         PENDING.pop((peer_id, msg_id), None)
         await _safe_answer(cb, "Отправлено ✅")
         await _replace_buttons_with_status(
@@ -1170,6 +1231,7 @@ async def handle_edited(message: Message) -> None:
         logger.exception("Не удалось отправить доработанный ответ собеседнику id=%s", ctx.peer_id)
         await message.reply("⚠️ Не удалось отправить (проверьте доступ). Попробуйте ещё раз.")
         return
+    _push_dialog(ctx.peer_id, "me", refined)
     logger.info("Отправлен доработанный ответ собеседнику id=%s", ctx.peer_id)
     EDIT_CTX.pop(message.id, None)
     await message.reply(f"✅ Отправлено собеседнику ({ctx.peer_name}).")
@@ -1541,6 +1603,7 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
             await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить (проверьте доступ)")
             return
         IN_FLIGHT.discard(key)
+        _push_dialog(peer_id, "me", variant)
         PENDING.pop(key, None)
         await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
         await bot_edit_with_status(

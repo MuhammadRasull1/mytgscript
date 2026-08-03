@@ -1,14 +1,8 @@
 .env
 *.session
+*.session-journal
 __pycache__/
 *.pyc
 .venv/
 venv/
-
-# ВНИМАНИЕ: n8n/*.json теперь содержат секреты (GEMINI_API_KEY, BOT_TOKEN,
-# X-Api-Key). Если будете публиковать репозиторий — не коммитьте их.
-
-.env
-*.session
-*.session-journal
-__pycache__/
+n8n/

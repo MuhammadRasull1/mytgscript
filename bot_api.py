@@ -178,3 +178,15 @@ async def healthcheck_server() -> None:
     logger.info("Healthcheck server started on port %s", port)
     # Keep the server running indefinitely
     await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    # При запуске bot_api.py напрямую, запускаем userbot.main()
+    # Это нужно для Render, который запускает bot_api.py как основной скрипт.
+    import userbot
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(userbot.main())
+    except KeyboardInterrupt:
+        logger.info("Остановлено пользователем")

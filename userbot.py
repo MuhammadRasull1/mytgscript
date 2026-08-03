@@ -125,8 +125,21 @@ bot_user_id: Optional[int] = None       # id управляющего бота (
 # (peer_id, message_id) -> контекст: варианты ответа из ИИ + имя собеседника
 # (нужно для статуса «✅ Отправлено для <Имя>: …» после нажатия кнопки)
 PENDING: dict[tuple[int, int], dict[str, Any]] = {}
-# message_id сообщения-черновика («отредактируй это» / черновик бота) -> (peer_id, peer_name)
-EDIT_CTX: dict[int, tuple[int, str]] = {}
+
+
+@dataclass
+class EditCtx:
+    """Контекст доработки черновика (AI-refinement)."""
+
+    peer_id: int          # собеседник, которому уйдёт ответ
+    peer_name: str
+    peer_msg_id: int      # id сообщения собеседника (для reply_to_message_id)
+    original: str         # исходное сообщение собеседника
+    draft: str            # текущий черновик
+
+
+# message_id сообщения-черновика (доработки) -> контекст правки
+EDIT_CTX: dict[int, EditCtx] = {}
 # Ключи (peer_id, message_id), для которых отправка уже идёт (защита от двойного клика)
 IN_FLIGHT: set[tuple[int, int]] = set()
 
@@ -166,6 +179,23 @@ AI_SYSTEM_PROMPT = (
     "преамбул и лишнего текста — только сами варианты."
 )
 
+REFINE_SYSTEM_PROMPT = (
+    "Ты — ассистент, помогающий владельцу Telegram-аккаунта дорабатывать черновик "
+    "ответа на сообщение собеседника. В ТОЧНОСТИ выполняй указание пользователя: "
+    "стиль, язык, тональность, включая сленг, эмоциональную окраску и ненормативную "
+    "лексику, если пользователь просит отвечать дерзко или с матом. Если пользователь "
+    "просит написать на конкретном языке (узбекский, русский, английский и т.п.) — "
+    "пиши строго на этом языке. Верни только готовый текст ответа, без пояснений, "
+    "преамбул и лишнего текста."
+)
+
+GEMINI_SAFETY = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
+
 
 def _build_user_prompt(text: str, peer_name: str) -> str:
     return (
@@ -173,6 +203,14 @@ def _build_user_prompt(text: str, peer_name: str) -> str:
         f"Сообщение: {text}\n\n"
         f"Предложи {CFG.max_suggestions} варианта ответа (только варианты, по одному "
         "на строку, пронумерованные)."
+    )
+
+
+def _build_refine_prompt(original: str, draft: str, instruction: str) -> str:
+    return (
+        f"Исходное сообщение собеседника:\n{original or '(нет текста)'}\n\n"
+        f"Текущий черновик:\n{draft}\n\n"
+        f"Указание пользователя (выполни строго):\n{instruction}"
     )
 
 
@@ -197,15 +235,16 @@ def _parse_suggestions(raw: str) -> list[str]:
     return out
 
 
-async def _call_gemini(text: str, peer_name: str) -> Optional[str]:
-    """Генерация вариантов через Gemini API. Возвращает None при ошибке/лимите."""
+async def _gemini_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
+    """Вызов Gemini. Возвращает текст ответа или None при ошибке/лимите."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         logger.info("GEMINI_API_KEY не задана — пропускаем Gemini")
         return None
     body = {
-        "contents": [{"parts": [{"text": _build_user_prompt(text, peer_name)}]}],
-        "systemInstruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
+        "contents": [{"parts": [{"text": user_prompt}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "safetySettings": GEMINI_SAFETY,
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500},
     }
     try:
@@ -227,8 +266,8 @@ async def _call_gemini(text: str, peer_name: str) -> Optional[str]:
     return "\n".join(p.get("text", "") for p in parts).strip() or None
 
 
-async def _call_groq(text: str, peer_name: str) -> Optional[str]:
-    """Генерация вариантов через Groq API (фоллбек). Возвращает None при ошибке."""
+async def _groq_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
+    """Вызов Groq (фоллбек). Возвращает текст ответа или None при ошибке."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         logger.info("GROQ_API_KEY не задана — пропускаем Groq")
@@ -236,8 +275,8 @@ async def _call_groq(text: str, peer_name: str) -> Optional[str]:
     body = {
         "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": AI_SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(text, peer_name)},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.7,
         "max_tokens": 500,
@@ -264,15 +303,32 @@ async def _call_groq(text: str, peer_name: str) -> Optional[str]:
         return None
 
 
-async def generate_suggestions(text: str, peer_name: str) -> list[str]:
-    """Генерирует варианты ответа напрямую: Gemini, при лимитах — Groq."""
-    raw = await _call_gemini(text, peer_name)
+async def _generate_with_fallback(system_prompt: str, user_prompt: str) -> Optional[str]:
+    """Gemini, при лимитах/ошибках — автоматический фоллбек на Groq."""
+    raw = await _gemini_generate(system_prompt, user_prompt)
     if raw is None:
         logger.info("Gemini недоступен/лимит — автоматический фоллбек на Groq")
-        raw = await _call_groq(text, peer_name)
+        raw = await _groq_generate(system_prompt, user_prompt)
+    return raw
+
+
+async def generate_suggestions(text: str, peer_name: str) -> list[str]:
+    """Генерирует варианты ответа напрямую: Gemini, при лимитах — Groq."""
+    raw = await _generate_with_fallback(
+        AI_SYSTEM_PROMPT, _build_user_prompt(text, peer_name)
+    )
     suggestions = _parse_suggestions(raw) if raw else []
     logger.info("Сгенерировано вариантов ответа: %s", len(suggestions))
     return suggestions
+
+
+async def refine_draft(original: str, draft: str, instruction: str) -> Optional[str]:
+    """AI-доработка черновика по произвольному указанию пользователя."""
+    user_prompt = _build_refine_prompt(original, draft, instruction)
+    refined = await _generate_with_fallback(REFINE_SYSTEM_PROMPT, user_prompt)
+    if refined:
+        logger.info("Черновик доработан по указанию: %s", instruction[:60])
+    return refined
 
 # ---------------------------------------------------------------------------
 # Обработка входящих ЛС
@@ -336,6 +392,7 @@ async def handle_incoming(message: Message) -> None:
     PENDING[(payload["peer_id"], payload["message_id"])] = {
         "suggestions": suggestions,
         "peer_name": payload["peer_name"],
+        "original": payload["text"],
     }
 
     if CFG.ai_mode == "userbot":
@@ -524,9 +581,17 @@ async def handle_callback(cb: CallbackQuery) -> None:
     if action == "edit":
         sent = await client.send_message(
             service_chat_id,
-            f"✏️ Отредактируйте это сообщение — после правки оно уйдёт собеседнику.\n\n{variant}",
+            f"✏️ Редактируйте черновик. Пришлите правку ответом на это сообщение, "
+            f"например: «сделай вежливее», «перепиши с матом», «на узбекском языке» "
+            f"(или /cancel для отмены).\n\nЧерновик:\n{variant}",
         )
-        EDIT_CTX[sent.id] = (peer_id, peer_name)
+        EDIT_CTX[sent.id] = EditCtx(
+            peer_id=peer_id,
+            peer_name=peer_name,
+            peer_msg_id=msg_id,
+            original=entry.get("original") or "",
+            draft=variant,
+        )
         PENDING.pop((peer_id, msg_id), None)
         await _safe_answer(cb, "Сообщение для правки создано")
         await _replace_buttons_with_status(cb, "✏️ Создано сообщение для правки")
@@ -550,16 +615,30 @@ async def handle_callback(cb: CallbackQuery) -> None:
 
 
 async def handle_edited(message: Message) -> None:
-    """Правка сообщения в служебном чате -> отправка собеседнику (флоу «Редактировать»)."""
+    """Правка сообщения в служебном чате -> AI-доработка и отправка собеседнику."""
     if message.chat.id != service_chat_id:
         return
-    ctx = EDIT_CTX.pop(message.id, None)
+    ctx = EDIT_CTX.get(message.id)
     if ctx is None or not message.text:
         return
-    peer_id, peer_name = ctx
-    await client.send_message(peer_id, message.text)
-    logger.info("Отправлено отредактированное сообщение собеседнику id=%s", peer_id)
-    await message.reply(f"✅ Отправлено собеседнику ({peer_name}).")
+    if "/cancel" in message.text:
+        EDIT_CTX.pop(message.id, None)
+        await message.reply("❌ Отменено.")
+        return
+
+    refined = await refine_draft(ctx.original, ctx.draft, message.text.strip())
+    if not refined:
+        await message.reply("⚠️ Не удалось доработать текст. Попробуйте ещё раз.")
+        return
+    try:
+        await client.send_message(ctx.peer_id, refined, reply_to_message_id=ctx.peer_msg_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось отправить доработанный ответ собеседнику id=%s", ctx.peer_id)
+        await message.reply("⚠️ Не удалось отправить (проверьте доступ). Попробуйте ещё раз.")
+        return
+    logger.info("Отправлен доработанный ответ собеседнику id=%s", ctx.peer_id)
+    EDIT_CTX.pop(message.id, None)
+    await message.reply(f"✅ Отправлено собеседнику ({ctx.peer_name}).")
 
 # ---------------------------------------------------------------------------
 # Telegram Bot (@myaccounttbot): long-polling и кнопки в личном чате с владельцем
@@ -569,8 +648,11 @@ HELP_TEXT = (
     "🤖 Пульт AI-автоответчика.\n\n"
     "Когда вам пишут в ЛС, сюда приходят варианты ответа с кнопками:\n"
     "• [1] [2] [3] — отправить выбранный вариант собеседнику\n"
-    "• ✏️ Ред. — прислать черновик: ответьте на него своим текстом\n"
+    "• ✏️ Ред. — доработать черновик: ответьте на него правкой, например\n"
+    "  «сделай вежливее», «перепиши с матом», «на узбекском языке»\n"
     "• ⏭ Пропустить — ничего не отправлять\n\n"
+    "После доработки ИИ пришлёт обновлённый вариант с кнопками:\n"
+    "🚀 Отправить · ✏️ Редактировать ещё · ❌ Отмена\n\n"
     "Команды:\n"
     "/help — эта справка\n"
     "/cancel — отменить текущее редактирование"
@@ -622,6 +704,50 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
         await bot_api.answer_callback_query(cb_id, "Неизвестная кнопка")
         return
 
+    message = cb.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    base = message.get("text") or ""
+
+    # Кнопки доработанного черновика (rsend/redit/rcancel): контекст — в EDIT_CTX
+    if action in ("rsend", "redit", "rcancel"):
+        ctx = EDIT_CTX.get(message_id)
+        if ctx is None:
+            await bot_api.answer_callback_query(cb_id, "Контекст устарел (возможно, перезапуск)")
+            await bot_edit_with_status(chat_id, message_id, base, "⏳ Контекст устарел")
+            return
+        if action == "rsend":
+            try:
+                await client.send_message(
+                    ctx.peer_id, ctx.draft, reply_to_message_id=ctx.peer_msg_id
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось отправить доработанный ответ id=%s", ctx.peer_id)
+                await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить (проверьте доступ)")
+                return
+            EDIT_CTX.pop(message_id, None)
+            await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
+            await bot_edit_with_status(
+                chat_id, message_id, base, f"✅ Отправлено для {ctx.peer_name}: \"{ctx.draft}\""
+            )
+            return
+        if action == "redit":
+            await bot_api.edit_message_text(
+                owner_id,
+                message_id,
+                "✏️ Текущий черновик:\n\n" + esc_html(ctx.draft)
+                + "\n\nПришлите следующую правку <b>ответом на это сообщение</b> (или /cancel).",
+                parse_mode="HTML",
+                reply_markup={"inline_keyboard": []},
+            )
+            await bot_api.answer_callback_query(cb_id, "Жду следующую правку")
+            return
+        if action == "rcancel":
+            EDIT_CTX.pop(message_id, None)
+            await bot_edit_with_status(chat_id, message_id, base, "❌ Отменено")
+            await bot_api.answer_callback_query(cb_id, "Отменено ❌")
+            return
+
     key = (peer_id, msg_id)
     if key in IN_FLIGHT:
         await bot_api.answer_callback_query(cb_id, "⏳ Отправка уже выполняется…")
@@ -630,11 +756,6 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
     entry = PENDING.get(key) or {}
     items = entry.get("suggestions") or []
     peer_name = entry.get("peer_name") or str(peer_id)
-
-    message = cb.get("message") or {}
-    chat_id = (message.get("chat") or {}).get("id")
-    message_id = message.get("message_id")
-    base = message.get("text") or ""
 
     if action == "skip":
         await bot_api.answer_callback_query(cb_id, "Пропущено ⏭")
@@ -653,11 +774,18 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
     if action == "edit":
         sent = await bot_api.send_message(
             owner_id,
-            "✏️ Отредактируйте черновик и пришлите текст <b>ответом на это сообщение</b> "
+            "✏️ Редактируйте черновик. Пришлите правку <b>ответом на это сообщение</b>, "
+            "например: «сделай вежливее», «перепиши с матом», «на узбекском языке» "
             "(или /cancel для отмены).\n\nЧерновик:\n" + esc_html(variant),
             parse_mode="HTML",
         )
-        EDIT_CTX[sent["message_id"]] = (peer_id, peer_name)
+        EDIT_CTX[sent["message_id"]] = EditCtx(
+            peer_id=peer_id,
+            peer_name=peer_name,
+            peer_msg_id=msg_id,
+            original=entry.get("original") or "",
+            draft=variant,
+        )
         PENDING.pop(key, None)
         await bot_api.answer_callback_query(cb_id, "Сообщение для правки отправлено")
         await bot_edit_with_status(chat_id, message_id, base, "✏️ Создано сообщение для правки")
@@ -682,23 +810,23 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
 
 
 async def bot_handle_message(msg: dict[str, Any]) -> None:
-    """Сообщения владельца в чате с ботом: правка черновика ответом, команды."""
+    """Сообщения владельца в чате с ботом: правка черновика (AI), команды."""
     if (msg.get("from") or {}).get("id") != owner_id:
         return  # бот игнорирует посторонних
     text = (msg.get("text") or "").strip()
     reply_to = msg.get("reply_to_message") or {}
     bot_msg_id = reply_to.get("message_id")
 
+    if "/cancel" in text:
+        if bot_msg_id:
+            ctx = EDIT_CTX.pop(bot_msg_id, None)
+            if ctx is not None:
+                await bot_edit_with_status(owner_id, bot_msg_id, "", f"❌ Отменено ({ctx.peer_name})")
+        await bot_api.send_message(owner_id, "Отменено ✅")
+        return
+
     if text.startswith("/"):
         cmd = text.split()[0].lower()
-        if cmd == "/cancel":
-            ctx = EDIT_CTX.pop(bot_msg_id, None) if bot_msg_id else None
-            if ctx:
-                await bot_edit_with_status(owner_id, bot_msg_id, "", f"⏭ Отменено ({ctx[1]})")
-                await bot_api.send_message(owner_id, "Отменено ✅")
-            else:
-                await bot_api.send_message(owner_id, "Сейчас нет активного редактирования для отмены.")
-            return
         if cmd in ("/start", "/help"):
             await bot_api.send_message(owner_id, HELP_TEXT)
         return
@@ -706,22 +834,31 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
     if not text or not bot_msg_id:
         return  # простое сообщение без ответа на черновик — игнорируем
 
-    ctx = EDIT_CTX.pop(bot_msg_id, None)
+    ctx = EDIT_CTX.get(bot_msg_id)
     if ctx is None:
         return
-    peer_id, peer_name = ctx
-    try:
-        await client.send_message(peer_id, text)
-    except Exception:  # noqa: BLE001
-        logger.exception("Не удалось отправить отредактированный текст собеседнику id=%s", peer_id)
-        EDIT_CTX[bot_msg_id] = ctx  # вернём контекст, чтобы можно было повторить
-        await bot_api.send_message(
-            owner_id, "⚠️ Не удалось отправить (проверьте доступ к собеседнику). Ответьте ещё раз."
-        )
+
+    # Ответ на черновик = строгое указание для AI-доработки текущего черновика
+    refined = await refine_draft(ctx.original, ctx.draft, text)
+    if not refined:
+        await bot_api.send_message(owner_id, "⚠️ Не удалось доработать текст. Попробуйте ещё раз.")
         return
-    logger.info("Отправлен отредактированный текст собеседнику id=%s", peer_id)
-    await bot_edit_with_status(
-        owner_id, bot_msg_id, "", f"✅ Отправлено для {peer_name}: \"{text}\""
+
+    ctx.draft = refined
+    await bot_api.edit_message_text(
+        owner_id,
+        bot_msg_id,
+        f"✅ Применил: «{esc_html(text)}»\n\n{esc_html(refined)}",
+        parse_mode="HTML",
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "🚀 Отправить", "callback_data": "rsend|0|0|0"}],
+                [
+                    {"text": "✏️ Редактировать ещё", "callback_data": "redit|0|0|0"},
+                    {"text": "❌ Отмена", "callback_data": "rcancel|0|0|0"},
+                ],
+            ]
+        },
     )
 
 

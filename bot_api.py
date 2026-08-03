@@ -26,6 +26,9 @@ BOT_API_URL = "https://api.telegram.org/bot{token}/{method}"
 # Обновления, которые мы умеем обрабатывать: нажатия кнопок и сообщения владельца
 ALLOWED_UPDATES = ["callback_query", "message"]
 
+# Флаг для предотвращения повторного запуска веб-сервера в одном процессе
+_healthcheck_running = False
+
 
 class BotApiError(RuntimeError):
     """Ошибка Telegram Bot API (сеть, статус, поле ok:false)."""
@@ -162,6 +165,11 @@ class BotApiPoller:
 
 async def healthcheck_server() -> None:
     """HTTP-сервер заглушка для Render (healthcheck на aiohttp)."""
+    global _healthcheck_running
+    if _healthcheck_running:
+        logger.info("Healthcheck сервер уже запущен, пропускаем.")
+        return
+
     port = int(os.getenv("PORT", 8123))
     app = web.Application()
 
@@ -173,10 +181,16 @@ async def healthcheck_server() -> None:
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-    logger.info("Healthcheck server started on port %s", port)
-    # Keep the server running indefinitely
+    try:
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        await site.start()
+        _healthcheck_running = True
+        logger.info("Healthcheck server successfully started on port %s", port)
+    except OSError as exc:
+        logger.warning("Порт %s уже занят (%s). Сервер заглушка уже работает.", port, exc)
+        return
+
+    # Держим сервер запущенным в фоновом режиме
     await asyncio.Event().wait()
 
 
@@ -189,4 +203,4 @@ if __name__ == "__main__":
         loop = asyncio.get_event_loop()
         loop.run_until_complete(userbot.main())
     except KeyboardInterrupt:
-        logger.info("Остановлено пользователем")
+        logger.info("Остановлено пользователем")    

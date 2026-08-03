@@ -56,7 +56,7 @@ from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from bot_api import BotApiClient, BotApiError, BotApiPoller
+from bot_api import BotApiClient, BotApiError, BotApiPoller, healthcheck_server
 
 load_dotenv()
 
@@ -774,6 +774,8 @@ async def main() -> None:
     global http_session, service_chat_id, owner_id, bot_api, bot_user_id
 
     http_session = aiohttp.ClientSession()
+    # Запускаем фоновый HTTP-сервер для healthcheck Render
+    asyncio.create_task(healthcheck_server())
     await client.start()
     service_chat_id = client.me.id if CFG.service_chat.lower() == "me" else int(CFG.service_chat)
     owner_id = CFG.owner_id or client.me.id

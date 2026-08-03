@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+
+from aiohttp import web
 from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
@@ -155,3 +158,23 @@ class BotApiPoller:
                     logger.exception(
                         "Ошибка обработки обновления %s", update.get("update_id")
                     )
+
+
+async def healthcheck_server() -> None:
+    """HTTP-сервер заглушка для Render (healthcheck на aiohttp)."""
+    port = int(os.getenv("PORT", 8123))
+    app = web.Application()
+
+    async def handler(request):  # noqa: ARG001
+        return web.Response(text="OK")
+
+    app.router.add_get("/", handler)
+    app.router.add_get("/health", handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info("Healthcheck server started on port %s", port)
+    # Keep the server running indefinitely
+    await asyncio.Event().wait()

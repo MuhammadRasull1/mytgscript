@@ -1,0 +1,8 @@
+pyrogram>=2.0.106
+aiohttp>=3.9.5
+python-dotenv>=1.0.1
+# Telegram Bot API (@myaccounttbot) обслуживается через aiohttp (bot_api.py) —
+# новых зависимостей не требуется
+
+# Опционально: ускорение MTProto-соединения
+# PyTgCrypto>=1.2.8

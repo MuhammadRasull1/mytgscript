@@ -1235,7 +1235,7 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
         head = text.split(None, 1)[0]
         is_contact = head.startswith("@") or head.lstrip("-").isdigit()
         if is_contact:
-            contact = await _resolve_contact(text)
+            contact = await _resolve_contact(head)
             if contact is None:
                 await bot_api.send_message(
                     owner_id,

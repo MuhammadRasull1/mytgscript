@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI-автоответчик для личного Telegram (userbot на Pyrogram + n8n + Gemini/Groq).
+AI-автоответчик для личного Telegram (userbot на Pyrogram + Gemini/Groq).
 
-Архитектура:
+Архитектура (n8n и ngrok не нужны):
 
   1. Собеседник пишет вам в ЛС -> Pyrogram-клиент (ваша сессия) ловит сообщение.
-  2. userbot отправляет POST-вебхук в n8n (N8N_WEBHOOK_URL) с данными сообщения.
-  3. n8n (workflow_ai_responder) вызывает Gemini/Groq и отвечает вебхуку JSON
-     {"ok": true, "suggestions": [...]}; userbot сохраняет варианты в памяти
+  2. userbot сам вызывает Gemini API (gemini-2.5-flash) и получает 3 варианта
+     ответа; при ошибке лимитов (429/Quota) автоматически фоллбек на Groq API
+     (llama-3.3-70b-versatile). Варианты сохраняются в памяти
      (PENDING[(peer_id, msg_id)]).
-  4. Режим AI_MODE=bot_chat (по умолчанию): варианты с настоящими inline-кнопками
+  3. Режим AI_MODE=bot_chat (по умолчанию): варианты с настоящими inline-кнопками
      [1] [2] [3] [✏️ Ред.] [⏭ Пропустить] уходят через Bot API (BOT_TOKEN)
      в ваш личный чат с ботом @myaccounttbot. Нажатия ловит встроенный
-     long-polling (bot_api.py) — n8n для кнопок не нужен.
-  5. Вы нажимаете [1]/[2]/[3] -> выбранный текст уходит собеседнику (как ответ
+     long-polling (bot_api.py).
+  4. Вы нажимаете [1]/[2]/[3] -> выбранный текст уходит собеседнику (как ответ
      на его сообщение), а сообщение в чате с ботом редактируется:
      кнопки убираются, дописывается «✅ Отправлено для <Имя>: "текст"».
-  6. Старые режимы: AI_MODE=userbot — кнопки в «Избранном», нажатия ловит сам
-     userbot; AI_MODE=bot — кнопки рисует бот через n8n, нажатия обрабатывает
-     n8n (workflow_send_callbacks) через POST /api/command.
-  7. НИЧЕГО не отправляется автоматически — только по вашему явному действию.
+  5. Старый режим: AI_MODE=userbot — кнопки в «Избранном», нажатия ловит сам
+     userbot.
+  6. НИЧЕГО не отправляется автоматически — только по вашему явному действию.
 
 Запуск:
     python3 -m venv .venv && source .venv/bin/activate
@@ -41,7 +40,6 @@ from datetime import datetime
 from typing import Any, Optional
 
 import aiohttp
-from aiohttp import web
 from dotenv import load_dotenv
 
 # Совместимость с Python 3.14: pyrogram при импорте вызывает
@@ -72,30 +70,12 @@ logger = logging.getLogger("userbot")
 # ---------------------------------------------------------------------------
 
 
-def _resolve_webhook_url() -> str:
-    """Полный URL вебхука n8n (из .env через python-dotenv).
-
-    Приоритет: N8N_WEBHOOK_URL (полный адрес) -> WEBHOOK_URL (база, к ней
-    добавляется /webhook/telegram-in) -> локальный дефолт.
-    """
-    url = os.getenv("N8N_WEBHOOK_URL") or os.getenv("WEBHOOK_URL") or ""
-    if not url:
-        return "http://localhost:5678/webhook/telegram-in"
-    if "/webhook/telegram-in" not in url:
-        url = url.rstrip("/") + "/webhook/telegram-in"
-    return url
-
-
 @dataclass
 class Config:
     api_id: int
     api_hash: str
     session_name: str
-    n8n_webhook_url: str
-    n8n_timeout: int
-    callback_host: str
-    callback_port: int
-    callback_api_key: str
+    ai_timeout: int
     service_chat: str      # "me" (Избранное) или числовой id чата/группы
     ai_mode: str           # "bot_chat" | "userbot" | "bot"
     max_suggestions: int
@@ -112,11 +92,7 @@ class Config:
                 or "e86032b40b0213197262024220b333a2"
             ),
             session_name=os.getenv("SESSION_NAME", "ai_responder"),
-            n8n_webhook_url=_resolve_webhook_url(),
-            n8n_timeout=int(os.getenv("N8N_TIMEOUT_SEC", "90")),
-            callback_host=os.getenv("CALLBACK_HOST", "0.0.0.0"),
-            callback_port=int(os.getenv("CALLBACK_PORT", "8123")),
-            callback_api_key=os.getenv("CALLBACK_API_KEY", "change-me-strong-secret"),
+            ai_timeout=int(os.getenv("AI_TIMEOUT_SEC") or os.getenv("N8N_TIMEOUT_SEC") or "60"),
             service_chat=os.getenv("SERVICE_CHAT_ID", "me"),
             ai_mode=os.getenv("AI_MODE", "bot_chat").lower(),
             max_suggestions=int(os.getenv("MAX_SUGGESTIONS", "3")),
@@ -146,7 +122,7 @@ owner_id: Optional[int] = None         # владелец: MY_TELEGRAM_ID или
 bot_api: Optional[BotApiClient] = None  # клиент Bot API (только режим bot_chat)
 bot_user_id: Optional[int] = None       # id управляющего бота (для отсечки его ЛС)
 
-# (peer_id, message_id) -> контекст: варианты ответа из n8n + имя собеседника
+# (peer_id, message_id) -> контекст: варианты ответа из ИИ + имя собеседника
 # (нужно для статуса «✅ Отправлено для <Имя>: …» после нажатия кнопки)
 PENDING: dict[tuple[int, int], dict[str, Any]] = {}
 # message_id сообщения-черновика («отредактируй это» / черновик бота) -> (peer_id, peer_name)
@@ -175,37 +151,128 @@ def describe_media(message: Message) -> str:
     return str(message.media.value) if message.media else "text"
 
 
-async def request_suggestions(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Отправляет вебхук в n8n и ждёт JSON-ответ с вариантами ответа."""
-    logger.info("Отправка POST на вебхук n8n: %s", CFG.n8n_webhook_url)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models"
+    "/{model}:generateContent"
+)
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+AI_SYSTEM_PROMPT = (
+    "Ты — ассистент, который помогает владельцу Telegram-аккаунта отвечать в личных "
+    "сообщениях. По сообщению собеседника придумай короткие и естественные варианты "
+    "ответа от первого лица, по одному на строку, пронумерованные. Никаких пояснений, "
+    "преамбул и лишнего текста — только сами варианты."
+)
+
+
+def _build_user_prompt(text: str, peer_name: str) -> str:
+    return (
+        f"Собеседник: {peer_name or 'Незнакомец'}\n"
+        f"Сообщение: {text}\n\n"
+        f"Предложи {CFG.max_suggestions} варианта ответа (только варианты, по одному "
+        "на строку, пронумерованные)."
+    )
+
+
+def _parse_suggestions(raw: str) -> list[str]:
+    """Извлекает нумерованные/буллет-строки из текста LLM в список вариантов."""
+    out: list[str] = []
+    for line in (raw or "").splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        if len(item) > 1 and item[0].isdigit() and item[1] in ".):":
+            item = item[2:].strip()
+        elif item.startswith(("- ", "• ", "— ")):
+            item = item[2:].strip()
+        item = item.strip('"\'»“”')
+        if item and item not in out:
+            out.append(item)
+        if len(out) >= CFG.max_suggestions:
+            break
+    if not out and (raw or "").strip():
+        return [(raw or "").strip().strip('"')]
+    return out
+
+
+async def _call_gemini(text: str, peer_name: str) -> Optional[str]:
+    """Генерация вариантов через Gemini API. Возвращает None при ошибке/лимите."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.info("GEMINI_API_KEY не задана — пропускаем Gemini")
+        return None
+    body = {
+        "contents": [{"parts": [{"text": _build_user_prompt(text, peer_name)}]}],
+        "systemInstruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500},
+    }
     try:
         async with http_session.post(
-            CFG.n8n_webhook_url,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=CFG.n8n_timeout),
+            GEMINI_API_URL.format(model=GEMINI_MODEL),
+            params={"key": api_key},
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=CFG.ai_timeout),
         ) as resp:
-            if resp.status >= 300:
-                error_body = (await resp.text(errors="replace"))[:500]
-                logger.warning(
-                    "n8n вернул ошибку (вебхук %s): статус %s, ответ: %s",
-                    CFG.n8n_webhook_url,
-                    resp.status,
-                    error_body or "(пусто)",
-                )
+            if resp.status >= 400:
+                err = (await resp.text(errors="replace"))[:300]
+                logger.warning("Gemini %s: HTTP %s %s", GEMINI_MODEL, resp.status, err)
                 return None
-            logger.info(
-                "n8n ответил успешно (вебхук %s, статус %s)",
-                CFG.n8n_webhook_url,
-                resp.status,
-            )
-            return await resp.json(content_type=None)
+            data = await resp.json(content_type=None)
     except Exception as exc:  # noqa: BLE001
-        logger.exception(
-            "Ошибка обращения к n8n (вебхук %s): %s",
-            CFG.n8n_webhook_url,
-            exc,
-        )
+        logger.warning("Ошибка обращения к Gemini (%s): %s", GEMINI_MODEL, exc)
         return None
+    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+    return "\n".join(p.get("text", "") for p in parts).strip() or None
+
+
+async def _call_groq(text: str, peer_name: str) -> Optional[str]:
+    """Генерация вариантов через Groq API (фоллбек). Возвращает None при ошибке."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        logger.info("GROQ_API_KEY не задана — пропускаем Groq")
+        return None
+    body = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "user", "content": _build_user_prompt(text, peer_name)},
+        ],
+        "temperature": 0.7,
+        "max_tokens": 500,
+    }
+    try:
+        async with http_session.post(
+            GROQ_API_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=CFG.ai_timeout),
+        ) as resp:
+            if resp.status >= 400:
+                err = (await resp.text(errors="replace"))[:300]
+                logger.warning("Groq %s: HTTP %s %s", GROQ_MODEL, resp.status, err)
+                return None
+            data = await resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ошибка обращения к Groq (%s): %s", GROQ_MODEL, exc)
+        return None
+    try:
+        return (data["choices"][0]["message"]["content"] or "").strip() or None
+    except (KeyError, IndexError, TypeError):
+        logger.warning("Groq вернул неожиданный ответ: %s", data)
+        return None
+
+
+async def generate_suggestions(text: str, peer_name: str) -> list[str]:
+    """Генерирует варианты ответа напрямую: Gemini, при лимитах — Groq."""
+    raw = await _call_gemini(text, peer_name)
+    if raw is None:
+        logger.info("Gemini недоступен/лимит — автоматический фоллбек на Groq")
+        raw = await _call_groq(text, peer_name)
+    suggestions = _parse_suggestions(raw) if raw else []
+    logger.info("Сгенерировано вариантов ответа: %s", len(suggestions))
+    return suggestions
 
 # ---------------------------------------------------------------------------
 # Обработка входящих ЛС
@@ -222,7 +289,7 @@ async def handle_incoming(message: Message) -> None:
     if message.chat.id == service_chat_id:
         return  # не обрабатываем собственный служебный чат
     # В режиме bot_chat игнорируем сообщения управляющего бота: иначе его кнопки
-    # ушли бы в n8n как «входящее ЛС» и породили бы бесконечный цикл
+    # ушли бы в генерацию ИИ как «входящее ЛС» и породили бы бесконечный цикл
     if bot_user_id is not None and (
         message.chat.id == bot_user_id
         or (message.from_user and message.from_user.id == bot_user_id)
@@ -256,20 +323,16 @@ async def handle_incoming(message: Message) -> None:
         payload["text"][:80] or "(без текста)",
     )
 
-    response = await request_suggestions(payload)
-    suggestions = (response or {}).get("suggestions") or []
-    suggestions = [
-        s.strip() for s in suggestions if isinstance(s, str) and s.strip()
-    ][: CFG.max_suggestions]
+    suggestions = await generate_suggestions(payload["text"], payload["peer_name"])
 
     if not suggestions:
         await notify_owner(
             f"⚠️ Не удалось получить варианты ответа для {payload['peer_name']}.\n"
-            "Проверьте n8n (workflow_ai_responder) и ключ Gemini/Groq."
+            "Проверьте GEMINI_API_KEY / GROQ_API_KEY в .env."
         )
         return
 
-    # Всегда сохраняем варианты — по ним n8n (или inline-кнопки) командуют отправку
+    # Сохраняем варианты — по ним inline-кнопки командуют отправку
     PENDING[(payload["peer_id"], payload["message_id"])] = {
         "suggestions": suggestions,
         "peer_name": payload["peer_name"],
@@ -280,9 +343,7 @@ async def handle_incoming(message: Message) -> None:
     elif CFG.ai_mode == "bot_chat":
         await show_bot_chat_buttons(payload, suggestions)
     else:
-        logger.info(
-            "Варианты получены (режим bot) — кнопки рисует Telegram-бот через n8n"
-        )
+        logger.info("Варианты получены (режим bot): %s", suggestions)
 
 
 async def show_native_buttons(payload: dict[str, Any], suggestions: list[str]) -> None:
@@ -665,82 +726,6 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP-сервер: Callback-команды от n8n (POST /api/command)
-# ---------------------------------------------------------------------------
-
-
-async def api_health(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "ai-responder-userbot"})
-
-
-def _resolve_variant(body: dict[str, Any]) -> Optional[str]:
-    """Берёт text из тела команды, либо вариант из PENDING по peer_id+message_id+index."""
-    text = (body.get("text") or "").strip()
-    if text:
-        return text
-    entry = PENDING.get((body.get("peer_id"), body.get("message_id"))) or {}
-    items = entry.get("suggestions") or []
-    idx = body.get("index") or 0
-    if idx < len(items):
-        return items[idx]
-    return None
-
-
-async def api_command(request: web.Request) -> web.Response:
-    if request.headers.get("X-Api-Key", "") != CFG.callback_api_key:
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"ok": False, "error": "invalid json body"}, status=400)
-
-    command = body.get("command")
-    logger.info("Callback-команда от n8n: %s (peer=%s)", command, body.get("peer_id"))
-
-    if command == "send_reply":
-        peer_id = body.get("peer_id")
-        variant = _resolve_variant(body)
-        if not peer_id or not variant:
-            return web.json_response(
-                {"ok": False, "error": "peer_id и text (или index) обязательны"}, status=400
-            )
-        await client.send_message(peer_id, variant, reply_to_message_id=body.get("message_id"))
-        PENDING.pop((body.get("peer_id"), body.get("message_id")), None)
-        return web.json_response({"ok": True, "sent_to": peer_id})
-
-    if command == "edit_reply":
-        peer_id = body.get("peer_id")
-        variant = _resolve_variant(body)
-        if not peer_id or not variant:
-            return web.json_response(
-                {"ok": False, "error": "peer_id и text (или index) обязательны"}, status=400
-            )
-        entry = PENDING.get((body.get("peer_id"), body.get("message_id"))) or {}
-        peer_name = entry.get("peer_name") or str(peer_id)
-        sent = await client.send_message(
-            service_chat_id,
-            f"✏️ Отредактируйте это сообщение — после правки оно уйдёт собеседнику.\n\n{variant}",
-        )
-        EDIT_CTX[sent.id] = (peer_id, peer_name)
-        PENDING.pop((body.get("peer_id"), body.get("message_id")), None)
-        return web.json_response({"ok": True, "editable_message_id": sent.id})
-
-    if command == "skip":
-        logger.info("Пропущено (команда от n8n)")
-        return web.json_response({"ok": True})
-
-    if command == "status":
-        return web.json_response({
-            "ok": True,
-            "status": "running",
-            "ai_mode": CFG.ai_mode,
-            "service_chat_id": service_chat_id,
-            "n8n_webhook_url": CFG.n8n_webhook_url,
-        })
-
-    return web.json_response({"ok": False, "error": f"unknown command: {command}"}, status=400)
-
-# ---------------------------------------------------------------------------
 # Pyrogram-клиент и регистрация обработчиков
 # ---------------------------------------------------------------------------
 
@@ -795,8 +780,8 @@ async def main() -> None:
             raise SystemExit("Проверьте BOT_TOKEN в .env (токен бота из BotFather)") from exc
         bot_user_id = me.get("id")
         logger.info("Управляющий бот: @%s (id=%s)", me.get("username"), bot_user_id)
-        # Используем long polling -> сбрасываем вебхук, если он был зарегистрирован
-        # (например, n8n Workflow 2). Если токеном пользуется ещё что-то — будет 409.
+        # Используем long polling -> сбрасываем вебхук, если он был зарегистрирован.
+        # Если токеном пользуется ещё что-то — будет 409.
         try:
             await bot_api.delete_webhook(drop_pending_updates=True)
         except BotApiError as exc:
@@ -814,29 +799,6 @@ async def main() -> None:
             f"🤖 AI-автоответчик запущен (режим: {CFG.ai_mode}). Слушаю входящие ЛС…",
         )
 
-    app = web.Application()
-    app.router.add_get("/health", api_health)
-    app.router.add_post("/api/command", api_command)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, CFG.callback_host, CFG.callback_port)
-    try:
-        await site.start()
-    except OSError as exc:
-        # Порт уже занят — скорее всего сервер запустила healthcheck_server()
-        # из bot_api.py. Это не фатально: команды от n8n и healthcheck всё равно
-        # обслуживаются, а главный процесс должен продолжать (idle() ниже).
-        logger.warning(
-            "Порт %s:%s уже занят — HTTP-сервер команд не стартовал в userbot "
-            "(вероятно, его держит healthcheck_server): %s",
-            CFG.callback_host, CFG.callback_port, exc,
-        )
-    else:
-        logger.info(
-            "HTTP-сервер (команды от n8n) слушает http://%s:%s/api/command",
-            CFG.callback_host, CFG.callback_port,
-        )
-
     try:
         await idle()
     finally:
@@ -844,7 +806,6 @@ async def main() -> None:
             poller_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await poller_task
-        await runner.cleanup()
         await http_session.close()
         await client.stop()
 

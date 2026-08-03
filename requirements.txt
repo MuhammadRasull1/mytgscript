@@ -1,6 +1,7 @@
 pyrogram>=2.0.106
 aiohttp>=3.9.5
 python-dotenv>=1.0.1
+duckduckgo-search>=8.0.0
 # Telegram Bot API (@myaccounttbot) обслуживается через aiohttp (bot_api.py) —
 # новых зависимостей не требуется
 

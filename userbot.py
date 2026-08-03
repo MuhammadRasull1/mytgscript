@@ -286,8 +286,11 @@ REFINE_SYSTEM_PROMPT = (
     "стиль, язык, тональность, включая сленг, эмоциональную окраску и ненормативную "
     "лексику, если пользователь просит отвечать дерзко или с матом. Если пользователь "
     "просит написать на конкретном языке (узбекский, русский, английский и т.п.) — "
-    "пиши строго на этом языке. Верни только готовый текст ответа, без пояснений, "
-    "преамбул и лишнего текста."
+    "пиши строго на этом языке. При генерации текста на узбекском языке обязательно "
+    "используй литературные нормы и правильную грамматику (например: «Tug'ilgan "
+    "kuningiz bilan»/«Туғилган кунингиз билан», уважительные обращения «Yusuf aka», "
+    "«Siz»). Избегай дословных переводов с русского. Верни только готовый текст "
+    "ответа, без пояснений, преамбул и лишнего текста."
 )
 
 GEMINI_SAFETY = [
@@ -436,9 +439,12 @@ CONTENT_SYSTEM_PROMPT = (
     "Ты — креативный ассистент, который по запросу владельца Telegram-аккаунта "
     "придумывает готовые тексты (поздравления, отмазки, сообщения и т.п.). "
     "В ТОЧНОСТИ выполняй запрос: тему, цель, стиль и ЯЗЫК — если указан конкретный "
-    "язык (узбекский, русский, английский и т.п.), пиши строго на нём. Допускаются "
-    "разговорный сленг, жёсткий юмор и ненормативная лексика, если пользователь "
-    "просит. Верни ровно 3 варианта, по одному на строку, пронумерованные. "
+    "язык (узбекский, русский, английский и т.п.), пиши строго на нём. При генерации "
+    "текста на узбекском языке обязательно используй литературные нормы и правильную "
+    "грамматику (например: «Tug'ilgan kuningiz bilan»/«Туғилган кунингиз билан», "
+    "уважительные обращения «Yusuf aka», «Siz»). Избегай дословных переводов с русского. "
+    "Допускаются разговорный сленг, жёсткий юмор и ненормативная лексика, если "
+    "пользователь просит. Верни ровно 3 варианта, по одному на строку, пронумерованные. "
     "Без пояснений, преамбул и лишнего текста."
 )
 
@@ -806,7 +812,7 @@ HELP_TEXT = (
     "Команды:\n"
     "/help — эта справка\n"
     "/con <запрос> — генератор текстов (3 варианта):\n"
-    "  /con Поздравь Юсуф ака с ДР на узбекском\n"
+    "  /con @ky_747 поздравь Юсуф ака с ДР на узбекском\n"
     "  /con Придумай причину, почему я заболел и не приду сегодня\n"
     "/avto @username — включить автопилот для контакта\n"
     "/unavto @username — выключить автопилот для контакта\n"
@@ -857,8 +863,45 @@ async def _resolve_contact(ref: str) -> Optional[tuple[Any, str]]:
     return None
 
 
-async def handle_con_command(instruction: str) -> None:
-    """Команда /con: генерирует 3 текста по запросу и присылает с кнопками."""
+def _recipient_status_html(target: Any, target_name: str) -> str:
+    """Строка статуса получателя для сообщений /con."""
+    if target is not None:
+        label = target_name or str(target)
+        return f"🎯 Получатель: <b>{esc_html(label)}</b>"
+    return "🎯 Получатель: не указан — отправьте <b>@username</b>"
+
+
+def _extract_con_recipient(raw: str) -> tuple[Any, str, str]:
+    """Извлекает получателя из начала /con-запроса: '@username' или ID.
+
+    Возвращает (target, target_name, оставшийся запрос).
+    """
+    raw = raw.strip()
+    if raw.startswith("@"):
+        head, _, rest = raw.partition(" ")
+        if rest:
+            return head, head, rest.strip()
+    else:
+        head, _, rest = raw.partition(" ")
+        if head.lstrip("-").isdigit() and rest:
+            return int(head), str(int(head)), rest.strip()
+    return None, "", raw
+
+
+async def handle_con_command(arg: str) -> None:
+    """Команда /con: генерирует 3 текста по запросу и присылает с кнопками.
+
+    Получатель может быть указан прямо в команде: /con @ky_747 поздравь …
+    """
+    target, target_name, instruction = _extract_con_recipient(arg)
+    if not instruction:
+        await bot_api.send_message(
+            owner_id,
+            "Укажите запрос. Примеры:\n"
+            "/con @ky_747 поздравь Юсуф ака с ДР на узбекском\n"
+            "/con Придумай причину, почему я заболел и не приду сегодня",
+        )
+        return
     variants = await generate_content(instruction)
     if not variants:
         await bot_api.send_message(
@@ -868,7 +911,8 @@ async def handle_con_command(instruction: str) -> None:
         return
     body = (
         "🎨 Генератор текстов\n\n"
-        f"<i>«{esc_html(instruction)}»</i>\n\n"
+        f"{_recipient_status_html(target, target_name)}\n"
+        f"Тема: <i>«{esc_html(instruction)}»</i>\n\n"
         + "\n".join(f"<b>{i}.</b> {esc_html(v)}" for i, v in enumerate(variants, start=1))
     )
     buttons: list[list[dict[str, Any]]] = [
@@ -885,7 +929,12 @@ async def handle_con_command(instruction: str) -> None:
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось отправить результат /con")
         return
-    GEN_CTX[sent["message_id"]] = GenCtx(instruction=instruction, variants=variants)
+    GEN_CTX[sent["message_id"]] = GenCtx(
+        instruction=instruction,
+        variants=variants,
+        target=target,
+        target_name=target_name,
+    )
 
 
 async def _handle_gen_callback(
@@ -903,15 +952,13 @@ async def _handle_gen_callback(
             await bot_api.answer_callback_query(cb_id, "Контекст устарел (возможно, перезапуск)")
             return
         gen.selected = gen.variants[idx]
-        gen.target = None
-        gen.target_name = ""
         await bot_api.answer_callback_query(cb_id, f"Выбран вариант {idx + 1}")
         await bot_api.edit_message_text(
             owner_id,
             message_id,
             f"Выбран вариант <b>{idx + 1}</b>:\n\n{esc_html(gen.selected)}\n\n"
-            "Укажите контакт (<b>@username</b> или ID) ответом на это сообщение, "
-            "либо пришлите правку текста, чтобы доработать его.",
+            f"{_recipient_status_html(gen.target, gen.target_name)}\n\n"
+            "Пришлите правку ответом, чтобы доработать текст, либо нажмите 🚀 Отправить.",
             parse_mode="HTML",
             reply_markup=_refine_inline_keyboard(),
         )
@@ -921,7 +968,16 @@ async def _handle_gen_callback(
             await bot_api.answer_callback_query(cb_id, "Сначала выберите вариант")
             return
         if gen.target is None:
-            await bot_api.answer_callback_query(cb_id, "Укажите контакт: ответьте @username или ID")
+            # Получатель не указан — запрашиваем отдельным чётким сообщением
+            ask = await bot_api.send_message(
+                owner_id,
+                "🎯 Получатель не указан.\n"
+                "Ответьте <b>@username</b> или цифровым ID, кому отправить текст "
+                "(например: <b>@ky_747</b> или <b>123456789</b>).",
+                parse_mode="HTML",
+            )
+            GEN_CTX[ask["message_id"]] = gen
+            await bot_api.answer_callback_query(cb_id, "Укажите получателя")
             return
         try:
             await client.send_message(gen.target, gen.selected)
@@ -944,7 +1000,8 @@ async def _handle_gen_callback(
             owner_id,
             message_id,
             f"Текущий текст:\n\n{esc_html(gen.selected)}\n\n"
-            "Пришлите правку ответом на это сообщение (или укажите контакт).",
+            f"{_recipient_status_html(gen.target, gen.target_name)}\n\n"
+            "Пришлите правку ответом на это сообщение (или укажите получателя).",
             parse_mode="HTML",
             reply_markup={"inline_keyboard": []},
         )
@@ -1174,16 +1231,28 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
     # Ответ на сообщение генератора /con: контакт для отправки или правка текста
     gen = GEN_CTX.get(bot_msg_id)
     if gen is not None and gen.selected:
-        contact = await _resolve_contact(text)
-        if contact is not None:
+        # Текст начинается с @ или состоит из цифр — это получатель, а не правка
+        head = text.split(None, 1)[0]
+        is_contact = head.startswith("@") or head.lstrip("-").isdigit()
+        if is_contact:
+            contact = await _resolve_contact(text)
+            if contact is None:
+                await bot_api.send_message(
+                    owner_id,
+                    "⚠️ Не удалось распознать получателя. Формат: @username или цифровой ID.",
+                )
+                return
             gen.target, gen.target_name = contact
             await bot_api.edit_message_text(
                 owner_id,
                 bot_msg_id,
-                f"Отправлю для <b>{esc_html(gen.target_name)}</b>:\n\n"
+                f"{_recipient_status_html(gen.target, gen.target_name)}\n\n"
                 f"{esc_html(gen.selected)}\n\nНажмите 🚀 Отправить.",
                 parse_mode="HTML",
                 reply_markup=_refine_inline_keyboard(),
+            )
+            await bot_api.send_message(
+                owner_id, f"🎯 Получатель установлен: {gen.target_name}."
             )
             return
         refined = await refine_draft(gen.instruction, gen.selected, text)
@@ -1195,7 +1264,8 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
             owner_id,
             bot_msg_id,
             f"✅ Применил: «{esc_html(text)}»\n\n{esc_html(refined)}\n\n"
-            "Укажите контакт (@username или ID) или пришлите ещё правку.",
+            f"{_recipient_status_html(gen.target, gen.target_name)}\n\n"
+            "Пришлите ещё правку или укажите получателя (@username / ID).",
             parse_mode="HTML",
             reply_markup=_refine_inline_keyboard(),
         )

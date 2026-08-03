@@ -820,11 +820,22 @@ async def main() -> None:
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, CFG.callback_host, CFG.callback_port)
-    await site.start()
-    logger.info(
-        "HTTP-сервер (команды от n8n) слушает http://%s:%s/api/command",
-        CFG.callback_host, CFG.callback_port,
-    )
+    try:
+        await site.start()
+    except OSError as exc:
+        # Порт уже занят — скорее всего сервер запустила healthcheck_server()
+        # из bot_api.py. Это не фатально: команды от n8n и healthcheck всё равно
+        # обслуживаются, а главный процесс должен продолжать (idle() ниже).
+        logger.warning(
+            "Порт %s:%s уже занят — HTTP-сервер команд не стартовал в userbot "
+            "(вероятно, его держит healthcheck_server): %s",
+            CFG.callback_host, CFG.callback_port, exc,
+        )
+    else:
+        logger.info(
+            "HTTP-сервер (команды от n8n) слушает http://%s:%s/api/command",
+            CFG.callback_host, CFG.callback_port,
+        )
 
     try:
         await idle()

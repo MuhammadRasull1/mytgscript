@@ -744,7 +744,9 @@ async def api_command(request: web.Request) -> web.Response:
 # Pyrogram-клиент и регистрация обработчиков
 # ---------------------------------------------------------------------------
 
-client = Client(CFG.session_name, api_id=CFG.api_id, api_hash=CFG.api_hash, workdir=".")
+session_str = os.getenv("SESSION_STRING")
+logger.info("SESSION_STRING подтянута из env: %s", bool(session_str))
+client = Client(CFG.session_name, api_id=CFG.api_id, api_hash=CFG.api_hash, workdir=".", session_string=session_str or None)
 
 
 def service_chat_filter(_, __, message: Message) -> bool:

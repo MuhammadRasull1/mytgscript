@@ -244,6 +244,128 @@ async def _remove_auto_user(ref: str) -> None:
 
 _load_auto_users()
 
+# --- Роли собеседников (мама/папа/кастомные) из data/user_roles.json ---
+USER_ROLES_FILE = os.path.join("data", "user_roles.json")
+USER_ROLES: dict[str, dict[str, str]] = {}
+
+
+def _load_user_roles() -> None:
+    """Загружает роли контактов из JSON: {'@username'|'id': {'role': ..., 'instruction': ...}}."""
+    global USER_ROLES
+    try:
+        with open(USER_ROLES_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            USER_ROLES = {
+                str(k): v for k, v in data.items() if isinstance(v, dict)
+            }
+        else:
+            USER_ROLES = {}
+    except (FileNotFoundError, ValueError, OSError):
+        USER_ROLES = {}
+
+
+def _save_user_roles() -> None:
+    os.makedirs(os.path.dirname(USER_ROLES_FILE) or ".", exist_ok=True)
+    with open(USER_ROLES_FILE, "w", encoding="utf-8") as fh:
+        json.dump(USER_ROLES, fh, ensure_ascii=False, indent=2)
+
+
+def _peer_role(peer: Any) -> Optional[dict[str, str]]:
+    """Возвращает роль собеседника из USER_ROLES или None."""
+    uname = getattr(peer, "username", None)
+    if uname:
+        entry = USER_ROLES.get("@" + str(uname).lower())
+        if entry:
+            return entry
+    return USER_ROLES.get(str(getattr(peer, "id", "")))
+
+
+def _role_prompt_suffix(peer: Any) -> str:
+    """Дополнение к системному промпту по роли собеседника (мама/папа/кастом)."""
+    role = _peer_role(peer)
+    if not role:
+        return ""
+    kind = role.get("role")
+    if kind == "mom":
+        return (
+            " ВАЖНО: это твоя МАМА. ВСЕГДА отвечай СТРОГО на узбекском языке, "
+            "уважительно, на «Siz», в роли заботливого сына. Никогда не обращайся "
+            "к ней «сынок», «дочка», «детка»."
+        )
+    if kind == "dad":
+        return (
+            " ВАЖНО: это твой ПАПА. Определи язык его сообщения: если он написал "
+            "по-русски — отвечай по-русски; если по-узбекски — по-узбекски. "
+            "Отвечай в роли уважительного сына («Да, пап», «Хорошо, сделаю»), "
+            "обращайся «пап» / «ада» / «отта» в зависимости от языка. Никогда не "
+            "обращайся к нему «сынок», «дочка», «детка»."
+        )
+    if kind == "custom":
+        instr = (role.get("instruction") or "").strip()
+        if instr:
+            return f" Дополнительное правило для этого собеседника: {instr}"
+    return ""
+
+
+async def _set_user_role(ref: str, kind: str, instruction: str = "") -> None:
+    """Назначает роль контакту (mom/dad/custom) и сохраняет в JSON."""
+    canonical = _normalize_ref(ref)
+    if not canonical:
+        await bot_api.send_message(
+            owner_id, "Некорректный контакт. Формат: @username или 123456789"
+        )
+        return
+    if kind == "custom":
+        if not instruction:
+            await bot_api.send_message(
+                owner_id, "Укажите инструкцию: /role @username <инструкция>"
+            )
+            return
+        USER_ROLES[canonical] = {"role": "custom", "instruction": instruction}
+    else:
+        USER_ROLES[canonical] = {"role": kind}
+    _save_user_roles()
+    label = {"mom": "МАМА 👩", "dad": "ПАПА 👨", "custom": "кастомная роль 🎭"}[kind]
+    await bot_api.send_message(
+        owner_id,
+        f"Роль установлена для <b>{esc_html(canonical)}</b>: {label}."
+        + (f"\nИнструкция: {esc_html(instruction)}" if instruction else ""),
+        parse_mode="HTML",
+    )
+
+
+async def _remove_user_role(ref: str) -> None:
+    canonical = _normalize_ref(ref)
+    if not canonical:
+        await bot_api.send_message(
+            owner_id, "Некорректный контакт. Формат: /unrole @username или /unrole 123456789"
+        )
+        return
+    if canonical not in USER_ROLES:
+        await bot_api.send_message(owner_id, f"{canonical} не имеет роли.")
+        return
+    USER_ROLES.pop(canonical, None)
+    _save_user_roles()
+    await bot_api.send_message(owner_id, f"Роль снята для <b>{esc_html(canonical)}</b>.", parse_mode="HTML")
+
+
+async def _handle_role_command(arg: str) -> None:
+    """Команда /role @username <инструкция>: назначает кастомную роль."""
+    target, _, instruction = _extract_con_recipient(arg)
+    if target is None or not instruction:
+        await bot_api.send_message(
+            owner_id,
+            "Формат: /role @username <инструкция>\n"
+            "Например: /role @friend_nick Отвечай дерзко, на сленге, мы друзья",
+        )
+        return
+    ref = str(target) if isinstance(target, int) else target
+    await _set_user_role(ref, "custom", instruction)
+
+
+_load_user_roles()
+
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
@@ -273,15 +395,28 @@ GEMINI_API_URL = (
 )
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
+BASE_ROLE_RULES = (
+    "Ты выступаешь от лица владельца аккаунта — это СЫН / молодой человек. "
+    "Твой собеседник — это ТВОЙ Папа, Твоя Мама, друг или группа. "
+    "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО обращаться к собеседнику «сынок», «дочка», «детка» "
+    "и любыми подобными обращениями: ты сын, а не родитель. "
+    "Если собеседник — Папа, обращайся к нему «пап» / «ада» / «отта» (в зависимости "
+    "от языка сообщения) с сыновьим уважением. "
+    "Если собеседник — Мама, обращайся к ней «мам» / «ойижон» / «оян» (в зависимости "
+    "от языка сообщения) с любовью и уважением. "
+)
+
 AI_SYSTEM_PROMPT = (
-    "Ты — ассистент, который помогает владельцу Telegram-аккаунта отвечать в личных "
+    BASE_ROLE_RULES
+    + "Ты — ассистент, который помогает владельцу Telegram-аккаунта отвечать в личных "
     "сообщениях. По сообщению собеседника придумай короткие и естественные варианты "
     "ответа от первого лица, по одному на строку, пронумерованные. Никаких пояснений, "
     "преамбул и лишнего текста — только сами варианты."
 )
 
 REFINE_SYSTEM_PROMPT = (
-    "Ты — ассистент, помогающий владельцу Telegram-аккаунта дорабатывать черновик "
+    BASE_ROLE_RULES
+    + "Ты — ассистент, помогающий владельцу Telegram-аккаунта дорабатывать черновик "
     "ответа на сообщение собеседника. В ТОЧНОСТИ выполняй указание пользователя: "
     "стиль, язык, тональность, включая сленг, эмоциональную окраску и ненормативную "
     "лексику, если пользователь просит отвечать дерзко или с матом. Если пользователь "
@@ -416,10 +551,16 @@ async def _generate_with_fallback(system_prompt: str, user_prompt: str) -> Optio
     return raw
 
 
-async def generate_suggestions(text: str, peer_name: str) -> list[str]:
-    """Генерирует варианты ответа напрямую: Gemini, при лимитах — Groq."""
+async def generate_suggestions(
+    text: str, peer_name: str, role_suffix: str = ""
+) -> list[str]:
+    """Генерирует варианты ответа напрямую: Gemini, при лимитах — Groq.
+
+    role_suffix — дополнительные правила промпта по роли собеседника
+    (мама/папа/кастомная из /role), проверяются перед генерацией.
+    """
     raw = await _generate_with_fallback(
-        AI_SYSTEM_PROMPT, _build_user_prompt(text, peer_name)
+        AI_SYSTEM_PROMPT + role_suffix, _build_user_prompt(text, peer_name)
     )
     suggestions = _parse_suggestions(raw) if raw else []
     logger.info("Сгенерировано вариантов ответа: %s", len(suggestions))
@@ -436,7 +577,8 @@ async def refine_draft(original: str, draft: str, instruction: str) -> Optional[
 
 
 CONTENT_SYSTEM_PROMPT = (
-    "Ты — креативный ассистент, который по запросу владельца Telegram-аккаунта "
+    BASE_ROLE_RULES
+    + "Ты — креативный ассистент, который по запросу владельца Telegram-аккаунта "
     "придумывает готовые тексты (поздравления, отмазки, сообщения и т.п.). "
     "В ТОЧНОСТИ выполняй запрос: тему, цель, стиль и ЯЗЫК — если указан конкретный "
     "язык (узбекский, русский, английский и т.п.), пиши строго на нём. При генерации "
@@ -499,6 +641,7 @@ async def handle_incoming(message: Message) -> None:
         "timestamp": int((message.date or datetime.now()).timestamp()),
         "is_forwarded": bool(message.forward_from or message.forward_sender_name),
         "media_type": describe_media(message),
+        "role_suffix": _role_prompt_suffix(peer),
     }
     logger.info(
         "Получено ЛС от %s (%s): %s",
@@ -512,7 +655,9 @@ async def handle_incoming(message: Message) -> None:
         await handle_auto_reply(payload)
         return
 
-    suggestions = await generate_suggestions(payload["text"], payload["peer_name"])
+    suggestions = await generate_suggestions(
+        payload["text"], payload["peer_name"], payload["role_suffix"]
+    )
 
     if not suggestions:
         await notify_owner(
@@ -546,7 +691,9 @@ def _peer_ref(payload: dict[str, Any]) -> str:
 async def handle_auto_reply(payload: dict[str, Any]) -> None:
     """Автопилот: генерируем ответ и сразу отправляем собеседнику без кнопок."""
     ref = _peer_ref(payload)
-    variants = await generate_suggestions(payload["text"], payload["peer_name"])
+    variants = await generate_suggestions(
+        payload["text"], payload["peer_name"], payload.get("role_suffix") or ""
+    )
     if not variants:
         await notify_owner(
             f"⚠️ Авто-ответ не удался для {ref}: не получены варианты. "
@@ -816,6 +963,11 @@ HELP_TEXT = (
     "  /con Придумай причину, почему я заболел и не приду сегодня\n"
     "/avto @username — включить автопилот для контакта\n"
     "/unavto @username — выключить автопилот для контакта\n"
+    "/mom @username — пометить как МАМА (ответ строго на узбекском, на «Siz»)\n"
+    "/dad @username — пометить как ПАПА (ответ на языке папы, уважительно)\n"
+    "/role @username <инструкция> — кастомная роль (например: «Отвечай дерзко, "
+    "мы друзья»)\n"
+    "/unrole @username — снять роль\n"
     "/cancel — отменить текущую генерацию/правку\n\n"
     "Когда вам пишут в ЛС, приходят варианты ответа с кнопками:\n"
     "• [1] [2] [3] — отправить выбранный вариант собеседнику\n"
@@ -1221,6 +1373,27 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
                 await bot_api.send_message(owner_id, "Использование: /unavto @username или /unavto 123456789")
                 return
             await _remove_auto_user(arg)
+            return
+        if cmd == "/mom":
+            if not arg:
+                await bot_api.send_message(owner_id, "Использование: /mom @username или /mom 123456789")
+                return
+            await _set_user_role(arg.split(None, 1)[0], "mom")
+            return
+        if cmd == "/dad":
+            if not arg:
+                await bot_api.send_message(owner_id, "Использование: /dad @username или /dad 123456789")
+                return
+            await _set_user_role(arg.split(None, 1)[0], "dad")
+            return
+        if cmd == "/role":
+            await _handle_role_command(arg)
+            return
+        if cmd == "/unrole":
+            if not arg:
+                await bot_api.send_message(owner_id, "Использование: /unrole @username или /unrole 123456789")
+                return
+            await _remove_user_role(arg.split(None, 1)[0])
             return
         await bot_api.send_message(owner_id, "Неизвестная команда. Наберите /help для списка команд.")
         return

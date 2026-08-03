@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -142,6 +143,106 @@ class EditCtx:
 EDIT_CTX: dict[int, EditCtx] = {}
 # Ключи (peer_id, message_id), для которых отправка уже идёт (защита от двойного клика)
 IN_FLIGHT: set[tuple[int, int]] = set()
+
+
+@dataclass
+class GenCtx:
+    """Контекст команды /con (генератор произвольных текстов)."""
+
+    instruction: str            # исходный запрос пользователя
+    variants: list[str]         # сгенерированные варианты
+    selected: str = ""          # выбранный вариант
+    target: Any = None          # контакт для отправки (int id или str username)
+    target_name: str = ""       # имя/метка контакта
+
+
+# message_id сообщения-результата /con -> контекст генератора
+GEN_CTX: dict[int, GenCtx] = {}
+
+# --- Автопилот: контакты (@username или id), отвечаем без кнопок ---
+AUTO_USERS_FILE = os.path.join("data", "auto_users.json")
+AUTO_USERS: set[str] = set()
+
+
+def _load_auto_users() -> None:
+    global AUTO_USERS
+    try:
+        with open(AUTO_USERS_FILE, "r", encoding="utf-8") as fh:
+            AUTO_USERS = set(json.load(fh))
+    except (FileNotFoundError, ValueError, OSError):
+        AUTO_USERS = set()
+
+
+def _save_auto_users() -> None:
+    os.makedirs(os.path.dirname(AUTO_USERS_FILE) or ".", exist_ok=True)
+    with open(AUTO_USERS_FILE, "w", encoding="utf-8") as fh:
+        json.dump(sorted(AUTO_USERS), fh, ensure_ascii=False, indent=2)
+
+
+def _normalize_ref(ref: str) -> Optional[str]:
+    """Нормализует упоминание контакта: '@username' -> '@username', число -> int."""
+    ref = ref.strip()
+    if ref.startswith("@"):
+        name = ref[1:].strip()
+        return "@" + name.lower() if name else None
+    if ref.lstrip("-").isdigit():
+        return str(int(ref))
+    return None
+
+
+def _is_auto_peer(peer: Any) -> bool:
+    """Проверяет, включён ли автопилот для данного собеседника."""
+    for ref in AUTO_USERS:
+        if ref.startswith("@"):
+            uname = getattr(peer, "username", None)
+            if uname and ref[1:] == uname.lower():
+                return True
+        elif str(getattr(peer, "id", "")) == ref:
+            return True
+    return False
+
+
+def _auto_list() -> str:
+    return "\n".join(f"• {r}" for r in sorted(AUTO_USERS)) or "— пусто —"
+
+
+async def _add_auto_user(ref: str) -> None:
+    canonical = _normalize_ref(ref)
+    if not canonical:
+        await bot_api.send_message(
+            owner_id, "Некорректный контакт. Формат: /avto @username или /avto 123456789"
+        )
+        return
+    AUTO_USERS.add(canonical)
+    _save_auto_users()
+    await bot_api.send_message(
+        owner_id,
+        f"🤖 Автопилот включён для <b>{canonical}</b>.\n\n"
+        f"Сейчас в списке:\n{_auto_list()}",
+        parse_mode="HTML",
+    )
+
+
+async def _remove_auto_user(ref: str) -> None:
+    canonical = _normalize_ref(ref)
+    if not canonical:
+        await bot_api.send_message(
+            owner_id, "Некорректный контакт. Формат: /unavto @username или /unavto 123456789"
+        )
+        return
+    if canonical not in AUTO_USERS:
+        await bot_api.send_message(owner_id, f"{canonical} не был в списке автопилота.")
+        return
+    AUTO_USERS.discard(canonical)
+    _save_auto_users()
+    await bot_api.send_message(
+        owner_id,
+        f"Автопилот выключен для <b>{canonical}</b>.\n\nСейчас в списке:\n{_auto_list()}",
+        parse_mode="HTML",
+    )
+
+
+_load_auto_users()
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
@@ -330,6 +431,27 @@ async def refine_draft(original: str, draft: str, instruction: str) -> Optional[
         logger.info("Черновик доработан по указанию: %s", instruction[:60])
     return refined
 
+
+CONTENT_SYSTEM_PROMPT = (
+    "Ты — креативный ассистент, который по запросу владельца Telegram-аккаунта "
+    "придумывает готовые тексты (поздравления, отмазки, сообщения и т.п.). "
+    "В ТОЧНОСТИ выполняй запрос: тему, цель, стиль и ЯЗЫК — если указан конкретный "
+    "язык (узбекский, русский, английский и т.п.), пиши строго на нём. Допускаются "
+    "разговорный сленг, жёсткий юмор и ненормативная лексика, если пользователь "
+    "просит. Верни ровно 3 варианта, по одному на строку, пронумерованные. "
+    "Без пояснений, преамбул и лишнего текста."
+)
+
+
+async def generate_content(instruction: str) -> list[str]:
+    """Генерация 3 готовых текстов по произвольному запросу (команда /con)."""
+    raw = await _generate_with_fallback(
+        CONTENT_SYSTEM_PROMPT, f"Запрос: {instruction}"
+    )
+    variants = _parse_suggestions(raw) if raw else []
+    logger.info("Сгенерировано текстов по запросу: %s", len(variants))
+    return variants
+
 # ---------------------------------------------------------------------------
 # Обработка входящих ЛС
 # ---------------------------------------------------------------------------
@@ -379,6 +501,11 @@ async def handle_incoming(message: Message) -> None:
         payload["text"][:80] or "(без текста)",
     )
 
+    # Автопилот: для контактов из списка ответ уходит сразу, без кнопок
+    if _is_auto_peer(peer):
+        await handle_auto_reply(payload)
+        return
+
     suggestions = await generate_suggestions(payload["text"], payload["peer_name"])
 
     if not suggestions:
@@ -401,6 +528,36 @@ async def handle_incoming(message: Message) -> None:
         await show_bot_chat_buttons(payload, suggestions)
     else:
         logger.info("Варианты получены (режим bot): %s", suggestions)
+
+
+def _peer_ref(payload: dict[str, Any]) -> str:
+    uname = payload.get("peer_username")
+    if uname:
+        return f"@{uname}"
+    return str(payload.get("peer_id"))
+
+
+async def handle_auto_reply(payload: dict[str, Any]) -> None:
+    """Автопилот: генерируем ответ и сразу отправляем собеседнику без кнопок."""
+    ref = _peer_ref(payload)
+    variants = await generate_suggestions(payload["text"], payload["peer_name"])
+    if not variants:
+        await notify_owner(
+            f"⚠️ Авто-ответ не удался для {ref}: не получены варианты. "
+            "Проверьте GEMINI_API_KEY / GROQ_API_KEY."
+        )
+        return
+    answer = variants[0]
+    try:
+        await client.send_message(
+            payload["peer_id"], answer, reply_to_message_id=payload["message_id"]
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Не удалось отправить авто-ответ для %s", ref)
+        await notify_owner(f"⚠️ Не удалось отправить авто-ответ для {ref}: {exc}")
+        return
+    logger.info("Авто-ответ отправлен для %s", ref)
+    await notify_owner(f"🤖 Авто-ответ отправлен для {ref}: {answer}")
 
 
 async def show_native_buttons(payload: dict[str, Any], suggestions: list[str]) -> None:
@@ -646,17 +803,158 @@ async def handle_edited(message: Message) -> None:
 
 HELP_TEXT = (
     "🤖 Пульт AI-автоответчика.\n\n"
-    "Когда вам пишут в ЛС, сюда приходят варианты ответа с кнопками:\n"
+    "Команды:\n"
+    "/help — эта справка\n"
+    "/con <запрос> — генератор текстов (3 варианта):\n"
+    "  /con Поздравь Юсуф ака с ДР на узбекском\n"
+    "  /con Придумай причину, почему я заболел и не приду сегодня\n"
+    "/avto @username — включить автопилот для контакта\n"
+    "/unavto @username — выключить автопилот для контакта\n"
+    "/cancel — отменить текущую генерацию/правку\n\n"
+    "Когда вам пишут в ЛС, приходят варианты ответа с кнопками:\n"
     "• [1] [2] [3] — отправить выбранный вариант собеседнику\n"
-    "• ✏️ Ред. — доработать черновик: ответьте на него правкой, например\n"
-    "  «сделай вежливее», «перепиши с матом», «на узбекском языке»\n"
+    "• ✏️ Ред. — доработать черновик (например «сделай вежливее», «с матом»,\n"
+    "  «на узбекском языке») — ответьте правкой на черновик\n"
     "• ⏭ Пропустить — ничего не отправлять\n\n"
     "После доработки ИИ пришлёт обновлённый вариант с кнопками:\n"
     "🚀 Отправить · ✏️ Редактировать ещё · ❌ Отмена\n\n"
-    "Команды:\n"
-    "/help — эта справка\n"
-    "/cancel — отменить текущее редактирование"
+    "Автопилот: для контактов из списка ответ уходит собеседнику сразу,\n"
+    "в этот чат приходит только уведомление."
 )
+
+
+def _refine_inline_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "🚀 Отправить", "callback_data": "rsend|0|0|0"}],
+            [
+                {"text": "✏️ Редактировать ещё", "callback_data": "redit|0|0|0"},
+                {"text": "❌ Отмена", "callback_data": "rcancel|0|0|0"},
+            ],
+        ]
+    }
+
+
+async def _resolve_contact(ref: str) -> Optional[tuple[Any, str]]:
+    """Распознаёт контакт из ответа: '@username' или числовой ID."""
+    ref = ref.strip()
+    if ref.startswith("@"):
+        username = ref[1:].lower()
+        try:
+            user = await client.get_users(username)
+            display = user.username or user.first_name or f"@{username}"
+            return user.id, display
+        except Exception:  # noqa: BLE001
+            return username, f"@{username}"
+    if ref.lstrip("-").isdigit():
+        uid = int(ref)
+        try:
+            user = await client.get_users(uid)
+            display = user.first_name or str(uid)
+        except Exception:  # noqa: BLE001
+            display = str(uid)
+        return uid, display
+    return None
+
+
+async def handle_con_command(instruction: str) -> None:
+    """Команда /con: генерирует 3 текста по запросу и присылает с кнопками."""
+    variants = await generate_content(instruction)
+    if not variants:
+        await bot_api.send_message(
+            owner_id,
+            "⚠️ Не удалось сгенерировать тексты. Проверьте GEMINI_API_KEY / GROQ_API_KEY в .env.",
+        )
+        return
+    body = (
+        "🎨 Генератор текстов\n\n"
+        f"<i>«{esc_html(instruction)}»</i>\n\n"
+        + "\n".join(f"<b>{i}.</b> {esc_html(v)}" for i, v in enumerate(variants, start=1))
+    )
+    buttons: list[list[dict[str, Any]]] = [
+        [
+            {"text": f"[{i}]", "callback_data": f"gensel|0|0|{i - 1}"}
+            for i in range(1, len(variants) + 1)
+        ],
+        [{"text": "❌ Отмена", "callback_data": "gencancel|0|0|0"}],
+    ]
+    try:
+        sent = await bot_api.send_message(
+            owner_id, body, parse_mode="HTML", reply_markup={"inline_keyboard": buttons}
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось отправить результат /con")
+        return
+    GEN_CTX[sent["message_id"]] = GenCtx(instruction=instruction, variants=variants)
+
+
+async def _handle_gen_callback(
+    action: str,
+    cb_id: Any,
+    chat_id: Any,
+    message_id: Any,
+    base: str,
+    idx: int,
+    gen: GenCtx,
+) -> None:
+    """Обработка кнопок команды /con."""
+    if action == "gensel":
+        if idx >= len(gen.variants):
+            await bot_api.answer_callback_query(cb_id, "Контекст устарел (возможно, перезапуск)")
+            return
+        gen.selected = gen.variants[idx]
+        gen.target = None
+        gen.target_name = ""
+        await bot_api.answer_callback_query(cb_id, f"Выбран вариант {idx + 1}")
+        await bot_api.edit_message_text(
+            owner_id,
+            message_id,
+            f"Выбран вариант <b>{idx + 1}</b>:\n\n{esc_html(gen.selected)}\n\n"
+            "Укажите контакт (<b>@username</b> или ID) ответом на это сообщение, "
+            "либо пришлите правку текста, чтобы доработать его.",
+            parse_mode="HTML",
+            reply_markup=_refine_inline_keyboard(),
+        )
+        return
+    if action == "rsend":
+        if not gen.selected:
+            await bot_api.answer_callback_query(cb_id, "Сначала выберите вариант")
+            return
+        if gen.target is None:
+            await bot_api.answer_callback_query(cb_id, "Укажите контакт: ответьте @username или ID")
+            return
+        try:
+            await client.send_message(gen.target, gen.selected)
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось отправить сгенерированный текст")
+            await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить (проверьте контакт)")
+            return
+        label = gen.target_name or str(gen.target)
+        GEN_CTX.pop(message_id, None)
+        await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
+        await bot_edit_with_status(
+            chat_id, message_id, base, f"✅ Отправлено для {label}: \"{gen.selected}\""
+        )
+        return
+    if action == "redit":
+        if not gen.selected:
+            await bot_api.answer_callback_query(cb_id, "Сначала выберите вариант")
+            return
+        await bot_api.edit_message_text(
+            owner_id,
+            message_id,
+            f"Текущий текст:\n\n{esc_html(gen.selected)}\n\n"
+            "Пришлите правку ответом на это сообщение (или укажите контакт).",
+            parse_mode="HTML",
+            reply_markup={"inline_keyboard": []},
+        )
+        await bot_api.answer_callback_query(cb_id, "Пришлите правку ответом")
+        return
+    if action in ("rcancel", "gencancel"):
+        GEN_CTX.pop(message_id, None)
+        await bot_edit_with_status(chat_id, message_id, base, "❌ Отменено")
+        await bot_api.answer_callback_query(cb_id, "Отменено ❌")
+        return
 
 
 async def bot_handle_update(update: dict[str, Any]) -> None:
@@ -709,8 +1007,14 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
     message_id = message.get("message_id")
     base = message.get("text") or ""
 
-    # Кнопки доработанного черновика (rsend/redit/rcancel): контекст — в EDIT_CTX
-    if action in ("rsend", "redit", "rcancel"):
+    # Кнопки доработанного черновика (rsend/redit/rcancel) и генератора /con
+    if action in ("rsend", "redit", "rcancel", "gensel", "gencancel"):
+        gen = GEN_CTX.get(message_id)
+        if gen is not None:
+            await _handle_gen_callback(
+                action, cb_id, chat_id, message_id, base, idx, gen
+            )
+            return
         ctx = EDIT_CTX.get(message_id)
         if ctx is None:
             await bot_api.answer_callback_query(cb_id, "Контекст устарел (возможно, перезапуск)")
@@ -810,7 +1114,7 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
 
 
 async def bot_handle_message(msg: dict[str, Any]) -> None:
-    """Сообщения владельца в чате с ботом: правка черновика (AI), команды."""
+    """Сообщения владельца в чате с ботом: команды, контакт/правка для /con, правка черновика."""
     if (msg.get("from") or {}).get("id") != owner_id:
         return  # бот игнорирует посторонних
     text = (msg.get("text") or "").strip()
@@ -818,27 +1122,90 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
     bot_msg_id = reply_to.get("message_id")
 
     if "/cancel" in text:
+        removed = False
         if bot_msg_id:
-            ctx = EDIT_CTX.pop(bot_msg_id, None)
-            if ctx is not None:
-                await bot_edit_with_status(owner_id, bot_msg_id, "", f"❌ Отменено ({ctx.peer_name})")
+            if EDIT_CTX.pop(bot_msg_id, None) is not None:
+                removed = True
+            if GEN_CTX.pop(bot_msg_id, None) is not None:
+                removed = True
+            if removed:
+                await bot_edit_with_status(owner_id, bot_msg_id, "", "❌ Отменено")
         await bot_api.send_message(owner_id, "Отменено ✅")
         return
 
     if text.startswith("/"):
-        cmd = text.split()[0].lower()
+        parts = text.split(None, 1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
         if cmd in ("/start", "/help"):
             await bot_api.send_message(owner_id, HELP_TEXT)
+            return
+        if cmd == "/con":
+            if not arg:
+                await bot_api.send_message(
+                    owner_id,
+                    "Использование: /con <запрос>\n"
+                    "Например:\n"
+                    "/con Поздравь Юсуф ака с ДР на узбекском\n"
+                    "/con Придумай причину, почему я заболел и не приду сегодня",
+                )
+                return
+            await handle_con_command(arg)
+            return
+        if cmd == "/avto":
+            if not arg:
+                await bot_api.send_message(owner_id, "Использование: /avto @username или /avto 123456789")
+                return
+            await _add_auto_user(arg)
+            return
+        if cmd == "/unavto":
+            if not arg:
+                await bot_api.send_message(owner_id, "Использование: /unavto @username или /unavto 123456789")
+                return
+            await _remove_auto_user(arg)
+            return
+        await bot_api.send_message(owner_id, "Неизвестная команда. Наберите /help для списка команд.")
         return
 
     if not text or not bot_msg_id:
-        return  # простое сообщение без ответа на черновик — игнорируем
+        return  # простое сообщение без ответа — игнорируем
 
+    # Ответ на сообщение генератора /con: контакт для отправки или правка текста
+    gen = GEN_CTX.get(bot_msg_id)
+    if gen is not None and gen.selected:
+        contact = await _resolve_contact(text)
+        if contact is not None:
+            gen.target, gen.target_name = contact
+            await bot_api.edit_message_text(
+                owner_id,
+                bot_msg_id,
+                f"Отправлю для <b>{esc_html(gen.target_name)}</b>:\n\n"
+                f"{esc_html(gen.selected)}\n\nНажмите 🚀 Отправить.",
+                parse_mode="HTML",
+                reply_markup=_refine_inline_keyboard(),
+            )
+            return
+        refined = await refine_draft(gen.instruction, gen.selected, text)
+        if not refined:
+            await bot_api.send_message(owner_id, "⚠️ Не удалось доработать текст. Попробуйте ещё раз.")
+            return
+        gen.selected = refined
+        await bot_api.edit_message_text(
+            owner_id,
+            bot_msg_id,
+            f"✅ Применил: «{esc_html(text)}»\n\n{esc_html(refined)}\n\n"
+            "Укажите контакт (@username или ID) или пришлите ещё правку.",
+            parse_mode="HTML",
+            reply_markup=_refine_inline_keyboard(),
+        )
+        return
+
+    # Ответ на черновик = строгое указание для AI-доработки текущего черновика
     ctx = EDIT_CTX.get(bot_msg_id)
     if ctx is None:
         return
 
-    # Ответ на черновик = строгое указание для AI-доработки текущего черновика
     refined = await refine_draft(ctx.original, ctx.draft, text)
     if not refined:
         await bot_api.send_message(owner_id, "⚠️ Не удалось доработать текст. Попробуйте ещё раз.")
@@ -850,15 +1217,7 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
         bot_msg_id,
         f"✅ Применил: «{esc_html(text)}»\n\n{esc_html(refined)}",
         parse_mode="HTML",
-        reply_markup={
-            "inline_keyboard": [
-                [{"text": "🚀 Отправить", "callback_data": "rsend|0|0|0"}],
-                [
-                    {"text": "✏️ Редактировать ещё", "callback_data": "redit|0|0|0"},
-                    {"text": "❌ Отмена", "callback_data": "rcancel|0|0|0"},
-                ],
-            ]
-        },
+        reply_markup=_refine_inline_keyboard(),
     )
 
 

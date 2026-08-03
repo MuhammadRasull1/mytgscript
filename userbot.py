@@ -21,6 +21,15 @@ AI-автоответчик для личного Telegram (userbot на Pyrogra
      userbot.
   6. НИЧЕГО не отправляется автоматически — только по вашему явному действию.
 
+Структура кода:
+  - userbot.py — инициализация, обработчики, точка входа (этот файл);
+  - services/roles_manager.py — роли собеседников (/mom /dad /role /unrole);
+  - services/search_service.py — интернет-поиск (/inter /uninter);
+  - services/ai_service.py — системные промпты, генерация ИИ, история диалога;
+  - services/con_handler.py — команда /con (генератор текстов);
+  - services/shared.py — общие объекты/хелперы (реестр для сервисов);
+  - bot_api.py — клиент Bot API для long-polling.
+
 Запуск:
     python3 -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
@@ -32,11 +41,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import html
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
@@ -66,6 +73,30 @@ logging.basicConfig(
 )
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger("userbot")
+
+# --- Сервисные модули (роли, поиск, ИИ, /con) ---
+from services.ai_service import EditCtx, _dialog_history_block, _push_dialog, generate_suggestions, refine_draft
+from services.con_handler import (
+    GenCtx,
+    _handle_gen_callback,
+    _recipient_status_html,
+    _refine_inline_keyboard,
+    _resolve_contact,
+    bot_edit_with_status,
+    handle_con_command,
+)
+from services.roles_manager import (
+    _handle_role_command,
+    _remove_user_role,
+    _role_prompt_suffix,
+    _set_user_role,
+)
+from services.search_service import (
+    _internet_prompt_suffix,
+    _set_internet_flag,
+    _web_search_context,
+)
+from services.shared import describe_media, esc_html, esc_md, shared
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -128,34 +159,10 @@ bot_user_id: Optional[int] = None       # id управляющего бота (
 # (нужно для статуса «✅ Отправлено для <Имя>: …» после нажатия кнопки)
 PENDING: dict[tuple[int, int], dict[str, Any]] = {}
 
-
-@dataclass
-class EditCtx:
-    """Контекст доработки черновика (AI-refinement)."""
-
-    peer_id: int          # собеседник, которому уйдёт ответ
-    peer_name: str
-    peer_msg_id: int      # id сообщения собеседника (для reply_to_message_id)
-    original: str         # исходное сообщение собеседника
-    draft: str            # текущий черновик
-
-
 # message_id сообщения-черновика (доработки) -> контекст правки
 EDIT_CTX: dict[int, EditCtx] = {}
 # Ключи (peer_id, message_id), для которых отправка уже идёт (защита от двойного клика)
 IN_FLIGHT: set[tuple[int, int]] = set()
-
-
-@dataclass
-class GenCtx:
-    """Контекст команды /con (генератор произвольных текстов)."""
-
-    instruction: str            # исходный запрос пользователя
-    variants: list[str]         # сгенерированные варианты
-    selected: str = ""          # выбранный вариант
-    target: Any = None          # контакт для отправки (int id или str username)
-    target_name: str = ""       # имя/метка контакта
-
 
 # message_id сообщения-результата /con -> контекст генератора
 GEN_CTX: dict[int, GenCtx] = {}
@@ -244,626 +251,6 @@ async def _remove_auto_user(ref: str) -> None:
 
 
 _load_auto_users()
-
-# --- Роли собеседников (мама/папа/кастомные) из data/user_roles.json ---
-USER_ROLES_FILE = os.path.join("data", "user_roles.json")
-USER_ROLES: dict[str, dict[str, str]] = {}
-
-
-def _load_user_roles() -> None:
-    """Загружает роли контактов из JSON: {'@username'|'id': {'role': ..., 'instruction': ...}}."""
-    global USER_ROLES
-    try:
-        with open(USER_ROLES_FILE, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            USER_ROLES = {
-                str(k): v for k, v in data.items() if isinstance(v, dict)
-            }
-        else:
-            USER_ROLES = {}
-    except (FileNotFoundError, ValueError, OSError):
-        USER_ROLES = {}
-
-
-def _save_user_roles() -> None:
-    os.makedirs(os.path.dirname(USER_ROLES_FILE) or ".", exist_ok=True)
-    with open(USER_ROLES_FILE, "w", encoding="utf-8") as fh:
-        json.dump(USER_ROLES, fh, ensure_ascii=False, indent=2)
-
-
-def _peer_role(peer: Any) -> Optional[dict[str, str]]:
-    """Возвращает роль собеседника из USER_ROLES или None."""
-    uname = getattr(peer, "username", None)
-    if uname:
-        entry = USER_ROLES.get("@" + str(uname).lower())
-        if entry:
-            return entry
-    return USER_ROLES.get(str(getattr(peer, "id", "")))
-
-
-def _role_prompt_suffix(peer: Any) -> str:
-    """Дополнение к системному промпту по роли собеседника (мама/папа/кастом)."""
-    role = _peer_role(peer)
-    if not role:
-        return ""
-    kind = role.get("role")
-    if kind == "mom":
-        return (
-            " ВАЖНО: это твоя МАМА — роль назначена. Ты отвечаешь от лица СЫНА. "
-            "ВСЕГДА отвечай СТРОГО на узбекском языке, уважительно, на «Siz», "
-            "обращаясь «Ойи/Мама». Не начинай каждое сообщение с обращения — "
-            "обращайся редко и естественно."
-        )
-    if kind == "dad":
-        return (
-            " ВАЖНО: это твой ПАПА — роль назначена. Ты отвечаешь от лица СЫНА. "
-            "Обращайся «Папа/Пап» (или «ада/отта» на узбекском) с сыновьим "
-            "уважением, сохраняя язык его сообщения: написал по-русски — отвечай "
-            "по-русски, по-узбекски — по-узбекски. Не начинай каждое сообщение с "
-            "обращения — обращайся редко и естественно («Да, пап», «Хорошо, сделаю»)."
-        )
-    if kind == "custom":
-        instr = (role.get("instruction") or "").strip()
-        if instr:
-            return f" Дополнительное правило для этого собеседника: {instr}"
-    return ""
-
-
-async def _set_user_role(ref: str, kind: str, instruction: str = "") -> None:
-    """Назначает роль контакту (mom/dad/custom) и сохраняет в JSON."""
-    canonical = _normalize_ref(ref)
-    if not canonical:
-        await bot_api.send_message(
-            owner_id, "Некорректный контакт. Формат: @username или 123456789"
-        )
-        return
-    if kind == "custom":
-        if not instruction:
-            await bot_api.send_message(
-                owner_id, "Укажите инструкцию: /role @username <инструкция>"
-            )
-            return
-        USER_ROLES[canonical] = {"role": "custom", "instruction": instruction}
-    else:
-        USER_ROLES[canonical] = {"role": kind}
-    _save_user_roles()
-    label = {"mom": "МАМА 👩", "dad": "ПАПА 👨", "custom": "кастомная роль 🎭"}[kind]
-    await bot_api.send_message(
-        owner_id,
-        f"Роль установлена для <b>{esc_html(canonical)}</b>: {label}."
-        + (f"\nИнструкция: {esc_html(instruction)}" if instruction else ""),
-        parse_mode="HTML",
-    )
-
-
-async def _remove_user_role(ref: str) -> None:
-    canonical = _normalize_ref(ref)
-    if not canonical:
-        await bot_api.send_message(
-            owner_id, "Некорректный контакт. Формат: /unrole @username или /unrole 123456789"
-        )
-        return
-    if canonical not in USER_ROLES:
-        await bot_api.send_message(owner_id, f"{canonical} не имеет роли.")
-        return
-    USER_ROLES.pop(canonical, None)
-    _save_user_roles()
-    await bot_api.send_message(owner_id, f"Роль снята для <b>{esc_html(canonical)}</b>.", parse_mode="HTML")
-
-
-async def _handle_role_command(arg: str) -> None:
-    """Команда /role @username <инструкция>: назначает кастомную роль."""
-    target, _, instruction = _extract_con_recipient(arg)
-    if target is None or not instruction:
-        await bot_api.send_message(
-            owner_id,
-            "Формат: /role @username <инструкция>\n"
-            "Например: /role @friend_nick Отвечай дерзко, на сленге, мы друзья",
-        )
-        return
-    ref = str(target) if isinstance(target, int) else target
-    await _set_user_role(ref, "custom", instruction)
-
-
-# --- Интернет-поиск: флаг has_internet + вызов поисковика ---
-WEB_SEARCH_BACKENDS = ("bing", "auto", "duckduckgo", "brave")
-WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
-
-_WEB_QUERY_CLEANER = re.compile(
-    r"^(?:что такое|что это|что значит|что за|кто такой|кто такая|"
-    r"расскажи про|расскажи о|расскажи мне про|объясни мне|объясни|"
-    r"что собой представляет|для чего нужен|для чего нужна|как работает|"
-    r"как называется|что делает)\s+",
-    re.IGNORECASE,
-)
-
-_WEB_SEARCH_TRIGGERS = (
-    "что такое", "что это", "что значит", "что за", "кто такой", "кто такая",
-    "расскажи про", "расскажи о", "объясни", "погода", "новости", "курс",
-    "цена", "сколько стоит", "как работает", "почему", "где находится",
-    "когда будет", "что делать если", "как называется", "для чего",
-    "nima", "qanday", "nima uchun", "ob-havo", "yangilik", "narxi", "qancha",
-    "what is", "how to", "why", "weather", "news", "price",
-)
-
-
-def _peer_has_internet(peer: Any) -> bool:
-    """Разрешён ли интернет-поиск для собеседника (has_internet в роли)."""
-    role = _peer_role(peer)
-    return bool(role and role.get("has_internet"))
-
-
-def _internet_prompt_suffix(peer: Any) -> str:
-    """Правило промпта про интернет-поиск в зависимости от флага has_internet."""
-    if _peer_has_internet(peer):
-        return (
-            " У тебя ВКЛЮЧЁН доступ к поиску в интернете для этого собеседника. "
-            "Если он задаёт вопрос, требующий свежих данных (что такое X, погода, "
-            "новости, курсы, цены, как работает и т.п.), используй предоставленные "
-            "в сообщении результаты поиска и сразу отвечай готовым ответом с "
-            "фактами, точно, просто и понятно, БЕЗ выдумок. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО "
-            "писать обещания-пустышки («Я сейчас поищу», «Давай, пап!» и т.п.) без "
-            "самой информации. Если результаты НЕ предоставлены — значит поиск не "
-            "дал результатов: честно скажи, что не смог найти актуальную информацию, "
-            "и предложи повторить позже. Для обычных бытовых сообщений поиск не нужен "
-            "— отвечай как обычно."
-        )
-    return (
-        " У тебя НЕТ доступа к поиску в интернете для этого собеседника. "
-        "Если он ПРОСИТ найти/поискать что-то в интернете или задаёт вопрос, ответ "
-        "на который требует свежих данных (погода сейчас, новости, курсы валют, "
-        "актуальная цена и т.п.), — вежливо откажи, согласно своей роли (например, "
-        "как сын папе): «У меня сейчас нет доступа к поиску в интернете для нашего "
-        "чата». По общим вопросам из твоих знаний отвечай как обычно, но без "
-        "выдуманных фактов."
-    )
-
-
-async def _set_internet_flag(ref: str, enabled: bool) -> None:
-    """Включает/выключает интернет-поиск для контакта и сохраняет в JSON."""
-    canonical = _normalize_ref(ref)
-    if not canonical:
-        await bot_api.send_message(
-            owner_id, "Некорректный контакт. Формат: /inter @username или /inter 123456789"
-        )
-        return
-    entry = USER_ROLES.get(canonical)
-    if entry is None:
-        entry = {"role": "custom"}
-        USER_ROLES[canonical] = entry
-    entry["has_internet"] = bool(enabled)
-    _save_user_roles()
-    status = "включён" if enabled else "выключен"
-    await bot_api.send_message(
-        owner_id,
-        f"🌐 Интернет-поиск {status} для <b>{esc_html(canonical)}</b>.",
-        parse_mode="HTML",
-    )
-
-
-def _needs_web_search(text: str) -> bool:
-    """Грубая эвристика: похоже ли сообщение на запрос, требующий поиска."""
-    t = text.strip()
-    if not t:
-        return False
-    if t.endswith("?"):
-        return True
-    low = t.lower()
-    return any(tr in low for tr in _WEB_SEARCH_TRIGGERS)
-
-
-def _clean_search_query(text: str) -> str:
-    """Убирает вводные фразы, чтобы поисковику отдать сам предмет запроса."""
-    q = text.strip().strip("?.!")
-    return _WEB_QUERY_CLEANER.sub("", q).strip() or text.strip()
-
-
-def _format_search_results(results: list[dict]) -> str:
-    """Форматирует результаты поиска для подачи в промпт ИИ."""
-    lines = []
-    for i, r in enumerate(results, 1):
-        title = (r.get("title") or "").strip()
-        body = (r.get("body") or "").strip()
-        href = (r.get("href") or "").strip()
-        part = f"{i}. {title}"
-        if body:
-            part += f" — {body}"
-        if href:
-            part += f" (источник: {href})"
-        lines.append(part)
-    return "\n".join(lines)
-
-
-async def _run_web_search(query: str) -> list[dict]:
-    """Поиск в интернете (duckduckgo_search) в отдельном потоке, с фоллбек-бэкендами."""
-    if not query.strip():
-        return []
-
-    def _do() -> list[dict]:
-        try:
-            import warnings
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                from duckduckgo_search import DDGS
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("duckduckgo_search не установлен — поиск недоступен: %s", exc)
-            return []
-        with DDGS() as ddgs:
-            for backend in WEB_SEARCH_BACKENDS:
-                try:
-                    res = ddgs.text(query, max_results=WEB_SEARCH_MAX_RESULTS, backend=backend)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Поиск backend=%s ошибка: %s", backend, exc)
-                    continue
-                if res:
-                    return res
-        return []
-
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_do), timeout=20)
-    except asyncio.TimeoutError:
-        logger.warning("Веб-поиск занял более 20с — пропускаем")
-        return []
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Ошибка веб-поиска: %s", exc)
-        return []
-
-
-WIKIPEDIA_API = "https://{lang}.wikipedia.org/w/api.php"
-
-
-async def _wikipedia_context(query: str) -> str:
-    """Фоллбек на Википедию (бесплатно, без ключа), когда поисковик не дал результатов."""
-    if http_session is None:
-        return ""
-    for lang in ("ru", "uz", "en"):
-        params = {
-            "action": "query",
-            "generator": "search",
-            "gsrsearch": query,
-            "gsrlimit": 3,
-            "prop": "extracts",
-            "exintro": 1,
-            "explaintext": 1,
-            "format": "json",
-        }
-        try:
-            async with http_session.get(
-                WIKIPEDIA_API.format(lang=lang),
-                params=params,
-                headers={"User-Agent": "TelegramAIResponder/1.0 (personal userbot; contact: owner)"},
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as resp:
-                if resp.status >= 400:
-                    continue
-                data = await resp.json(content_type=None)
-            pages = (data.get("query") or {}).get("pages") or {}
-            lines = []
-            for page in pages.values():
-                title = page.get("title", "")
-                extract = (page.get("extract") or "").strip()
-                if extract:
-                    lines.append(f"• {title}: {extract[:600]}")
-            if lines:
-                return "\n".join(lines[:3])
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Википедия %s: ошибка %s", lang, exc)
-    return ""
-
-
-async def _web_search_context(peer: Any, text: str) -> str:
-    """Возвращает результаты поиска для промпта, если они нужны собеседнику.
-
-    Сначала duckduckgo_search (несколько бэкендов), при пустом результате —
-    фоллбек на Википедию, чтобы точные ответы не зависели от лимитов поисковика.
-    """
-    if not _peer_has_internet(peer) or not _needs_web_search(text):
-        return ""
-    query = _clean_search_query(text)
-    results = await _run_web_search(query)
-    if results:
-        context = _format_search_results(results)
-        logger.info("Поиск «%s»: %s результатов", query, len(results))
-        return context
-    wiki = await _wikipedia_context(query)
-    if wiki:
-        logger.info("Поиск «%s»: фоллбек на Википедию", query)
-        return "Результаты из Википедии:\n" + wiki
-    logger.info("Поиск «%s»: результатов нет", query)
-    return ""
-
-
-_load_user_roles()
-
-# --- Контекст диалога: последние сообщения с каждым собеседником ---
-# peer_id -> [(role, text)], role: "peer" | "me"
-DIALOG_HISTORY: dict[Any, list[tuple[str, str]]] = {}
-HISTORY_LIMIT = 10  # храним не больше 10 записей, в промпт уходят последние 3-5
-
-
-def _push_dialog(peer_id: Any, role: str, text: str) -> None:
-    """Добавляет сообщение в историю переписки с собеседником."""
-    if not text:
-        return
-    hist = DIALOG_HISTORY.setdefault(peer_id, [])
-    hist.append((role, str(text)[:500]))
-    del hist[:-HISTORY_LIMIT]
-
-
-def _dialog_history_block(peer_id: Any, limit: int = 5) -> str:
-    """Форматирует последние N сообщений диалога для подстановки в промпт."""
-    hist = DIALOG_HISTORY.get(peer_id) or []
-    lines = []
-    for role, text in hist[-limit:]:
-        marker = "Собеседник" if role == "peer" else "Ты (владелец)"
-        lines.append(f"{marker}: {text}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Вспомогательные функции
-# ---------------------------------------------------------------------------
-
-
-def esc_md(text: str) -> str:
-    """Экранирует спецсимволы Markdown (чтобы текст собеседника не ломал разметку)."""
-    for ch in ("_", "*", "`", "["):
-        text = text.replace(ch, "\\" + ch)
-    return text
-
-
-def esc_html(text: str) -> str:
-    """Экранирует спецсимволы HTML (для сообщений чата с ботом, parse_mode=HTML)."""
-    return html.escape(str(text), quote=True)
-
-
-def describe_media(message: Message) -> str:
-    return str(message.media.value) if message.media else "text"
-
-
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models"
-    "/{model}:generateContent"
-)
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-BASE_ROLE_RULES = (
-    "Ты выступаешь от лица владельца аккаунта — это СЫН / молодой человек. "
-    "Твой собеседник — брат, друг, ровесник или обычный контакт, ЕСЛИ для него "
-    "не назначена специальная роль (папа / мама). "
-    "Если у собеседника нет роли папы или мамы, общайся с ним естественно и "
-    "дружелюбно, как ровесник с ровесником. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО обращаться "
-    "к собеседнику «пап», «сын», «мам», «сынок», «дочка», «детка» и любыми "
-    "подобными словами, если роль не назначена. "
-    "Не вставляй имя собеседника в каждое сообщение: пиши его только когда это "
-    "уместно по смыслу или владелец явно попросил. "
-    "Если собеседник — Папа, ты отвечаешь от лица СЫНА и обращаешься «Папа/Пап» "
-    "(или «ада/отта» в зависимости от языка) с сыновьим уважением. "
-    "Если собеседник — Мама, ты отвечаешь от лица СЫНА и обращаешься уважительно "
-    "«Ойи/Мама» строго на узбекском языке. "
-    "Не начинай каждое сообщение с обращения к родителям — обращайся редко и "
-    "естественно. "
-)
-
-AI_SYSTEM_PROMPT = (
-    BASE_ROLE_RULES
-    + "Ты — ассистент, который помогает владельцу Telegram-аккаунта отвечать в личных "
-    "сообщениях. По сообщению собеседника придумай короткие и естественные варианты "
-    "ответа от первого лица, по одному на строку, пронумерованные. Никаких пояснений, "
-    "преамбул и лишнего текста — только сами варианты."
-)
-
-REFINE_SYSTEM_PROMPT = (
-    BASE_ROLE_RULES
-    + "Ты — ассистент, помогающий владельцу Telegram-аккаунта дорабатывать черновик "
-    "ответа на сообщение собеседника. В ТОЧНОСТИ выполняй указание пользователя: "
-    "стиль, язык, тональность, включая сленг, эмоциональную окраску и ненормативную "
-    "лексику, если пользователь просит отвечать дерзко или с матом. Если пользователь "
-    "просит написать на конкретном языке (узбекский, русский, английский и т.п.) — "
-    "пиши строго на этом языке. При генерации текста на узбекском языке обязательно "
-    "используй литературные нормы и правильную грамматику (например: «Tug'ilgan "
-    "kuningiz bilan»/«Туғилган кунингиз билан», уважительные обращения «Yusuf aka», "
-    "«Siz»). Избегай дословных переводов с русского. Верни только готовый текст "
-    "ответа, без пояснений, преамбул и лишнего текста."
-)
-
-GEMINI_SAFETY = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-]
-
-
-def _build_user_prompt(
-    text: str, peer_name: str, web_context: str = "", history: str = "", username: str = ""
-) -> str:
-    who = peer_name or "Незнакомец"
-    if username:
-        who += f" (username: @{username})"
-    body = f"Собеседник: {who}"
-    if history:
-        body += f"\n\nИстория переписки с ним (последние сообщения, для контекста):\n{history}"
-    body += f"\n\nТекущее сообщение собеседника:\n{text}"
-    if web_context:
-        body += (
-            "\n\nРезультаты поиска в интернете (используй их для точного ответа, "
-            f"не выдумывай):\n{web_context}"
-        )
-    return (
-        body
-        + f"\n\nПредложи {CFG.max_suggestions} варианта ответа (только варианты, по одному "
-        "на строку, пронумерованные)."
-    )
-
-
-def _build_refine_prompt(original: str, draft: str, instruction: str) -> str:
-    return (
-        f"Исходное сообщение собеседника:\n{original or '(нет текста)'}\n\n"
-        f"Текущий черновик:\n{draft}\n\n"
-        f"Указание пользователя (выполни строго):\n{instruction}"
-    )
-
-
-def _parse_suggestions(raw: str) -> list[str]:
-    """Извлекает нумерованные/буллет-строки из текста LLM в список вариантов."""
-    out: list[str] = []
-    for line in (raw or "").splitlines():
-        item = line.strip()
-        if not item:
-            continue
-        if len(item) > 1 and item[0].isdigit() and item[1] in ".):":
-            item = item[2:].strip()
-        elif item.startswith(("- ", "• ", "— ")):
-            item = item[2:].strip()
-        item = item.strip('"\'»“”')
-        if item and item not in out:
-            out.append(item)
-        if len(out) >= CFG.max_suggestions:
-            break
-    if not out and (raw or "").strip():
-        return [(raw or "").strip().strip('"')]
-    return out
-
-
-async def _gemini_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
-    """Вызов Gemini. Возвращает текст ответа или None при ошибке/лимите."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        logger.info("GEMINI_API_KEY не задана — пропускаем Gemini")
-        return None
-    body = {
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "safetySettings": GEMINI_SAFETY,
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500},
-    }
-    try:
-        async with http_session.post(
-            GEMINI_API_URL.format(model=GEMINI_MODEL),
-            params={"key": api_key},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=CFG.ai_timeout),
-        ) as resp:
-            if resp.status >= 400:
-                err = (await resp.text(errors="replace"))[:300]
-                logger.warning("Gemini %s: HTTP %s %s", GEMINI_MODEL, resp.status, err)
-                return None
-            data = await resp.json(content_type=None)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Ошибка обращения к Gemini (%s): %s", GEMINI_MODEL, exc)
-        return None
-    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-    return "\n".join(p.get("text", "") for p in parts).strip() or None
-
-
-async def _groq_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
-    """Вызов Groq (фоллбек). Возвращает текст ответа или None при ошибке."""
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        logger.info("GROQ_API_KEY не задана — пропускаем Groq")
-        return None
-    body = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 500,
-    }
-    try:
-        async with http_session.post(
-            GROQ_API_URL,
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=CFG.ai_timeout),
-        ) as resp:
-            if resp.status >= 400:
-                err = (await resp.text(errors="replace"))[:300]
-                logger.warning("Groq %s: HTTP %s %s", GROQ_MODEL, resp.status, err)
-                return None
-            data = await resp.json(content_type=None)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Ошибка обращения к Groq (%s): %s", GROQ_MODEL, exc)
-        return None
-    try:
-        return (data["choices"][0]["message"]["content"] or "").strip() or None
-    except (KeyError, IndexError, TypeError):
-        logger.warning("Groq вернул неожиданный ответ: %s", data)
-        return None
-
-
-async def _generate_with_fallback(system_prompt: str, user_prompt: str) -> Optional[str]:
-    """Gemini, при лимитах/ошибках — автоматический фоллбек на Groq."""
-    raw = await _gemini_generate(system_prompt, user_prompt)
-    if raw is None:
-        logger.info("Gemini недоступен/лимит — автоматический фоллбек на Groq")
-        raw = await _groq_generate(system_prompt, user_prompt)
-    return raw
-
-
-async def generate_suggestions(
-    text: str,
-    peer_name: str,
-    role_suffix: str = "",
-    web_context: str = "",
-    history: str = "",
-    username: str = "",
-) -> list[str]:
-    """Генерирует варианты ответа напрямую: Gemini, при лимитах — Groq.
-
-    role_suffix — дополнительные правила промпта по роли собеседника
-    (мама/папа/кастомная из /role) и флагу интернет-поиска.
-    web_context — свежие результаты поиска, если /inter включён для собеседника.
-    history — последние сообщения диалога (контекст для коротких реплик).
-    username — @username собеседника (пассивное знание, без спама обращением).
-    """
-    raw = await _generate_with_fallback(
-        AI_SYSTEM_PROMPT + role_suffix,
-        _build_user_prompt(text, peer_name, web_context, history, username),
-    )
-    suggestions = _parse_suggestions(raw) if raw else []
-    logger.info("Сгенерировано вариантов ответа: %s", len(suggestions))
-    return suggestions
-
-
-async def refine_draft(original: str, draft: str, instruction: str) -> Optional[str]:
-    """AI-доработка черновика по произвольному указанию пользователя."""
-    user_prompt = _build_refine_prompt(original, draft, instruction)
-    refined = await _generate_with_fallback(REFINE_SYSTEM_PROMPT, user_prompt)
-    if refined:
-        logger.info("Черновик доработан по указанию: %s", instruction[:60])
-    return refined
-
-
-CONTENT_SYSTEM_PROMPT = (
-    BASE_ROLE_RULES
-    + "Ты — креативный ассистент, который по запросу владельца Telegram-аккаунта "
-    "придумывает готовые тексты (поздравления, отмазки, сообщения и т.п.). "
-    "В ТОЧНОСТИ выполняй запрос: тему, цель, стиль и ЯЗЫК — если указан конкретный "
-    "язык (узбекский, русский, английский и т.п.), пиши строго на нём. При генерации "
-    "текста на узбекском языке обязательно используй литературные нормы и правильную "
-    "грамматику (например: «Tug'ilgan kuningiz bilan»/«Туғилган кунингиз билан», "
-    "уважительные обращения «Yusuf aka», «Siz»). Избегай дословных переводов с русского. "
-    "Допускаются разговорный сленг, жёсткий юмор и ненормативная лексика, если "
-    "пользователь просит. Верни ровно 3 варианта, по одному на строку, пронумерованные. "
-    "Без пояснений, преамбул и лишнего текста."
-)
-
-
-async def generate_content(instruction: str) -> list[str]:
-    """Генерация 3 готовых текстов по произвольному запросу (команда /con)."""
-    raw = await _generate_with_fallback(
-        CONTENT_SYSTEM_PROMPT, f"Запрос: {instruction}"
-    )
-    variants = _parse_suggestions(raw) if raw else []
-    logger.info("Сгенерировано текстов по запросу: %s", len(variants))
-    return variants
 
 # ---------------------------------------------------------------------------
 # Обработка входящих ЛС
@@ -1269,214 +656,12 @@ HELP_TEXT = (
 )
 
 
-def _refine_inline_keyboard() -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [{"text": "🚀 Отправить", "callback_data": "rsend|0|0|0"}],
-            [
-                {"text": "✏️ Редактировать ещё", "callback_data": "redit|0|0|0"},
-                {"text": "❌ Отмена", "callback_data": "rcancel|0|0|0"},
-            ],
-        ]
-    }
-
-
-async def _resolve_contact(ref: str) -> Optional[tuple[Any, str]]:
-    """Распознаёт контакт из ответа: '@username' или числовой ID."""
-    ref = ref.strip()
-    if ref.startswith("@"):
-        username = ref[1:].lower()
-        try:
-            user = await client.get_users(username)
-            display = user.username or user.first_name or f"@{username}"
-            return user.id, display
-        except Exception:  # noqa: BLE001
-            return username, f"@{username}"
-    if ref.lstrip("-").isdigit():
-        uid = int(ref)
-        try:
-            user = await client.get_users(uid)
-            display = user.first_name or str(uid)
-        except Exception:  # noqa: BLE001
-            display = str(uid)
-        return uid, display
-    return None
-
-
-def _recipient_status_html(target: Any, target_name: str) -> str:
-    """Строка статуса получателя для сообщений /con."""
-    if target is not None:
-        label = target_name or str(target)
-        return f"🎯 Получатель: <b>{esc_html(label)}</b>"
-    return "🎯 Получатель: не указан — отправьте <b>@username</b>"
-
-
-def _extract_con_recipient(raw: str) -> tuple[Any, str, str]:
-    """Извлекает получателя из начала /con-запроса: '@username' или ID.
-
-    Возвращает (target, target_name, оставшийся запрос).
-    """
-    raw = raw.strip()
-    if raw.startswith("@"):
-        head, _, rest = raw.partition(" ")
-        if rest:
-            return head, head, rest.strip()
-    else:
-        head, _, rest = raw.partition(" ")
-        if head.lstrip("-").isdigit() and rest:
-            return int(head), str(int(head)), rest.strip()
-    return None, "", raw
-
-
-async def handle_con_command(arg: str) -> None:
-    """Команда /con: генерирует 3 текста по запросу и присылает с кнопками.
-
-    Получатель может быть указан прямо в команде: /con @ky_747 поздравь …
-    """
-    target, target_name, instruction = _extract_con_recipient(arg)
-    if not instruction:
-        await bot_api.send_message(
-            owner_id,
-            "Укажите запрос. Примеры:\n"
-            "/con @ky_747 поздравь Юсуф ака с ДР на узбекском\n"
-            "/con Придумай причину, почему я заболел и не приду сегодня",
-        )
-        return
-    variants = await generate_content(instruction)
-    if not variants:
-        await bot_api.send_message(
-            owner_id,
-            "⚠️ Не удалось сгенерировать тексты. Проверьте GEMINI_API_KEY / GROQ_API_KEY в .env.",
-        )
-        return
-    body = (
-        "🎨 Генератор текстов\n\n"
-        f"{_recipient_status_html(target, target_name)}\n"
-        f"Тема: <i>«{esc_html(instruction)}»</i>\n\n"
-        + "\n".join(f"<b>{i}.</b> {esc_html(v)}" for i, v in enumerate(variants, start=1))
-    )
-    buttons: list[list[dict[str, Any]]] = [
-        [
-            {"text": f"[{i}]", "callback_data": f"gensel|0|0|{i - 1}"}
-            for i in range(1, len(variants) + 1)
-        ],
-        [{"text": "❌ Отмена", "callback_data": "gencancel|0|0|0"}],
-    ]
-    try:
-        sent = await bot_api.send_message(
-            owner_id, body, parse_mode="HTML", reply_markup={"inline_keyboard": buttons}
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Не удалось отправить результат /con")
-        return
-    GEN_CTX[sent["message_id"]] = GenCtx(
-        instruction=instruction,
-        variants=variants,
-        target=target,
-        target_name=target_name,
-    )
-
-
-async def _handle_gen_callback(
-    action: str,
-    cb_id: Any,
-    chat_id: Any,
-    message_id: Any,
-    base: str,
-    idx: int,
-    gen: GenCtx,
-) -> None:
-    """Обработка кнопок команды /con."""
-    if action == "gensel":
-        if idx >= len(gen.variants):
-            await bot_api.answer_callback_query(cb_id, "Контекст устарел (возможно, перезапуск)")
-            return
-        gen.selected = gen.variants[idx]
-        await bot_api.answer_callback_query(cb_id, f"Выбран вариант {idx + 1}")
-        await bot_api.edit_message_text(
-            owner_id,
-            message_id,
-            f"Выбран вариант <b>{idx + 1}</b>:\n\n{esc_html(gen.selected)}\n\n"
-            f"{_recipient_status_html(gen.target, gen.target_name)}\n\n"
-            "Пришлите правку ответом, чтобы доработать текст, либо нажмите 🚀 Отправить.",
-            parse_mode="HTML",
-            reply_markup=_refine_inline_keyboard(),
-        )
-        return
-    if action == "rsend":
-        if not gen.selected:
-            await bot_api.answer_callback_query(cb_id, "Сначала выберите вариант")
-            return
-        if gen.target is None:
-            # Получатель не указан — запрашиваем отдельным чётким сообщением
-            ask = await bot_api.send_message(
-                owner_id,
-                "🎯 Получатель не указан.\n"
-                "Ответьте <b>@username</b> или цифровым ID, кому отправить текст "
-                "(например: <b>@ky_747</b> или <b>123456789</b>).",
-                parse_mode="HTML",
-            )
-            GEN_CTX[ask["message_id"]] = gen
-            await bot_api.answer_callback_query(cb_id, "Укажите получателя")
-            return
-        try:
-            await client.send_message(gen.target, gen.selected)
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось отправить сгенерированный текст")
-            await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить (проверьте контакт)")
-            return
-        label = gen.target_name or str(gen.target)
-        GEN_CTX.pop(message_id, None)
-        await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
-        await bot_edit_with_status(
-            chat_id, message_id, base, f"✅ Отправлено для {label}: \"{gen.selected}\""
-        )
-        return
-    if action == "redit":
-        if not gen.selected:
-            await bot_api.answer_callback_query(cb_id, "Сначала выберите вариант")
-            return
-        await bot_api.edit_message_text(
-            owner_id,
-            message_id,
-            f"Текущий текст:\n\n{esc_html(gen.selected)}\n\n"
-            f"{_recipient_status_html(gen.target, gen.target_name)}\n\n"
-            "Пришлите правку ответом на это сообщение (или укажите получателя).",
-            parse_mode="HTML",
-            reply_markup={"inline_keyboard": []},
-        )
-        await bot_api.answer_callback_query(cb_id, "Пришлите правку ответом")
-        return
-    if action in ("rcancel", "gencancel"):
-        GEN_CTX.pop(message_id, None)
-        await bot_edit_with_status(chat_id, message_id, base, "❌ Отменено")
-        await bot_api.answer_callback_query(cb_id, "Отменено ❌")
-        return
-
-
 async def bot_handle_update(update: dict[str, Any]) -> None:
     """Точка входа для обновлений из long-polling бота."""
     if "callback_query" in update:
         await bot_handle_callback(update["callback_query"])
     elif "message" in update:
         await bot_handle_message(update["message"])
-
-
-async def bot_edit_with_status(
-    chat_id: int, message_id: int, base: str, status: str
-) -> None:
-    """Редактирует сообщение бота: убирает inline-кнопки и дописывает статус."""
-    new_text = f"{base}\n\n{esc_html(status)}" if base else esc_html(status)
-    try:
-        await bot_api.edit_message_text(
-            chat_id,
-            message_id,
-            new_text,
-            parse_mode="HTML",
-            reply_markup={"inline_keyboard": []},
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning("Не удалось отредактировать сообщение бота", exc_info=True)
 
 
 async def bot_handle_callback(cb: dict[str, Any]) -> None:
@@ -1773,6 +958,24 @@ session_str = os.getenv("SESSION_STRING")
 logger.info("SESSION_STRING подтянута из env: %s", bool(session_str))
 client = Client(CFG.session_name, api_id=CFG.api_id, api_hash=CFG.api_hash, workdir=".", session_string=session_str or None)
 
+# Регистрация общего состояния/хелперов для сервисных модулей (services.*)
+shared.CFG = CFG
+shared.logger = logger
+shared.client = client
+shared.http_session = http_session
+shared.service_chat_id = service_chat_id
+shared.owner_id = owner_id
+shared.bot_api = bot_api
+shared.bot_user_id = bot_user_id
+shared.PENDING = PENDING
+shared.EDIT_CTX = EDIT_CTX
+shared.IN_FLIGHT = IN_FLIGHT
+shared.GEN_CTX = GEN_CTX
+shared._normalize_ref = _normalize_ref
+shared._is_auto_peer = _is_auto_peer
+shared._peer_ref = _peer_ref
+shared.notify_owner = notify_owner
+
 
 def service_chat_filter(_, __, message: Message) -> bool:
     return service_chat_id is not None and message.chat.id == service_chat_id
@@ -1801,11 +1004,14 @@ async def main() -> None:
     global http_session, service_chat_id, owner_id, bot_api, bot_user_id
 
     http_session = aiohttp.ClientSession()
+    shared.http_session = http_session
     # Запускаем фоновый HTTP-сервер для healthcheck Render
     asyncio.create_task(healthcheck_server())
     await client.start()
     service_chat_id = client.me.id if CFG.service_chat.lower() == "me" else int(CFG.service_chat)
+    shared.service_chat_id = service_chat_id
     owner_id = CFG.owner_id or client.me.id
+    shared.owner_id = owner_id
     logger.info("Вошли как %s (id=%s), владелец id=%s", client.me.first_name, client.me.id, owner_id)
 
     poller_task: Optional[asyncio.Task] = None
@@ -1813,12 +1019,14 @@ async def main() -> None:
         if not CFG.bot_token:
             raise SystemExit("AI_MODE=bot_chat требует BOT_TOKEN в .env (токен бота из BotFather)")
         bot_api = BotApiClient(CFG.bot_token, http_session)
+        shared.bot_api = bot_api
         try:
             me = await bot_api.get_me()
         except BotApiError as exc:
             logger.error("Не удалось получить getMe по BOT_TOKEN: %s", exc)
             raise SystemExit("Проверьте BOT_TOKEN в .env (токен бота из BotFather)") from exc
         bot_user_id = me.get("id")
+        shared.bot_user_id = bot_user_id
         logger.info("Управляющий бот: @%s (id=%s)", me.get("username"), bot_user_id)
         # Используем long polling -> сбрасываем вебхук, если он был зарегистрирован.
         # Если токеном пользуется ещё что-то — будет 409.

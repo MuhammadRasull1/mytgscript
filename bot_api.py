@@ -164,33 +164,39 @@ class BotApiPoller:
 
 
 async def healthcheck_server() -> None:
-    """HTTP-сервер заглушка для Render (healthcheck на aiohttp)."""
+    """HTTP-сервер заглушка для Render (healthcheck на aiohttp).
+
+    Функция никогда не завершается сама по себе: даже если сервер уже запущен
+    (флаг _healthcheck_running) или порт занят (OSError), мы всё равно уходим в
+    await asyncio.Event().wait(). Иначе корутина завершилась бы раньше времени
+    и сломала бы lifecycle userbot.main() на Render.
+    """
     global _healthcheck_running
-    if _healthcheck_running:
-        logger.info("Healthcheck сервер уже запущен, пропускаем.")
-        return
 
     port = int(os.getenv("PORT", 8123))
-    app = web.Application()
 
-    async def handler(request):  # noqa: ARG001
-        return web.Response(text="OK")
+    if _healthcheck_running:
+        logger.info("Healthcheck сервер уже запущен, пропускаем.")
+    else:
+        app = web.Application()
 
-    app.router.add_get("/", handler)
-    app.router.add_get("/health", handler)
+        async def handler(request):  # noqa: ARG001
+            return web.Response(text="OK")
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    try:
-        site = web.TCPSite(runner, host="0.0.0.0", port=port)
-        await site.start()
-        _healthcheck_running = True
-        logger.info("Healthcheck server successfully started on port %s", port)
-    except OSError as exc:
-        logger.warning("Порт %s уже занят (%s). Сервер заглушка уже работает.", port, exc)
-        return
+        app.router.add_get("/", handler)
+        app.router.add_get("/health", handler)
 
-    # Держим сервер запущенным в фоновом режиме
+        runner = web.AppRunner(app)
+        await runner.setup()
+        try:
+            site = web.TCPSite(runner, host="0.0.0.0", port=port)
+            await site.start()
+            _healthcheck_running = True
+            logger.info("Healthcheck server successfully started on port %s", port)
+        except OSError as exc:
+            logger.warning("Порт %s уже занят (%s). Сервер заглушка уже работает.", port, exc)
+
+    # Держим сервер запущенным в фоновом режиме — никогда не выходим
     await asyncio.Event().wait()
 
 

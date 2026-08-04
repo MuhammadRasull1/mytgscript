@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-import base64
+import contextlib
 import os
 import re
 import time
@@ -17,6 +17,20 @@ from typing import Any, Optional
 import aiohttp
 
 from services.shared import shared
+
+# Мультимодальные зависимости (google-genai + Pillow) — опциональные.
+# Если их нет, фото/ГС не отправляются в Gemini, бот продолжает работать по тексту.
+try:
+    from google import genai as _genai_sdk
+    from google.genai import types as _genai_types
+    from PIL import Image as _PILImage
+
+    _HAS_GENAI_SDK = True
+except Exception:  # noqa: BLE001
+    _genai_sdk = None
+    _genai_types = None
+    _PILImage = None
+    _HAS_GENAI_SDK = False
 
 # --- Прямая отправка сообщений: распознавание намерения ---
 
@@ -319,25 +333,135 @@ def _freeze_gemini_key(api_key: str) -> None:
     _GEMINI_KEY_FAILURES[api_key] = time.monotonic() + GEMINI_QUOTA_FREEZE_SEC
 
 
-def _read_media(
-    media_path: Optional[str], media_mime: Optional[str]
-) -> Optional[tuple[bytes, str]]:
-    """Читает временный файл медиа в (bytes, mime_type) для Gemini."""
-    if not media_path:
+def _media_kind(media_path: Optional[str], media_mime: Optional[str]) -> Optional[str]:
+    """Определяет тип медиа для Gemini: "image" | "audio" | None."""
+    if not media_path or not media_mime:
+        return None
+    m = media_mime.lower()
+    if "image" in m:
+        return "image"
+    if "audio" in m or "ogg" in m:
+        return "audio"
+    return None
+
+
+def _sdk_safety_settings() -> list:
+    """Конвертирует GEMINI_SAFETY (dict) в SafetySetting для google-genai."""
+    if not _HAS_GENAI_SDK:
+        return []
+    out = []
+    for item in GEMINI_SAFETY:
+        cat = getattr(_genai_types.HarmCategory, item["category"], None)
+        thr = getattr(_genai_types.HarmBlockThreshold, item["threshold"], None)
+        if cat and thr:
+            out.append(_genai_types.SafetySetting(category=cat, threshold=thr))
+    return out
+
+
+async def _gemini_call_text(
+    api_key: str, system_prompt: str, user_prompt: str
+) -> Optional[str]:
+    """Одиночный REST-вызов Gemini по тексту. None при ошибке/квоте."""
+    body = {
+        "contents": [{"parts": [{"text": user_prompt}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "safetySettings": GEMINI_SAFETY,
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500},
+    }
+    try:
+        async with shared.http_session.post(
+            GEMINI_API_URL.format(model=GEMINI_MODEL),
+            params={"key": api_key},
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=shared.CFG.ai_timeout),
+        ) as resp:
+            if resp.status == 429:
+                _freeze_gemini_key(api_key)
+                shared.logger.warning(
+                    "Gemini %s: квота (HTTP 429) — ключ заморожен на %s с",
+                    GEMINI_MODEL, GEMINI_QUOTA_FREEZE_SEC,
+                )
+                return None
+            if resp.status >= 400:
+                err = (await resp.text(errors="replace"))[:300]
+                shared.logger.warning("Gemini %s: HTTP %s %s", GEMINI_MODEL, resp.status, err)
+                return None
+            data = await resp.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        shared.logger.warning("Ошибка обращения к Gemini (%s): %s", GEMINI_MODEL, exc)
+        return None
+    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+    return "\n".join(p.get("text", "") for p in parts).strip() or None
+
+
+async def _gemini_call_with_media(
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    media_path: Optional[str],
+    media_mime: Optional[str],
+    media_kind: str,
+) -> Optional[str]:
+    """Мультимодальный вызов Gemini через google-genai (SDK).
+
+    image -> картинка открывается через PIL.Image.open(media_path) и передаётся
+    в contents вместе с текстом;
+    audio/ogg -> файл загружается через files.upload(file=media_path,
+    mime_type) и передаётся в contents. Загруженный файл ОБЯЗАТЕЛЬНО удаляется
+    через files.delete в блоке finally.
+    """
+    if not _HAS_GENAI_SDK:
+        shared.logger.warning(
+            "google-genai/Pillow не установлены — медиа (%s) пропускаем, генерируем по тексту",
+            media_kind,
+        )
         return None
     try:
-        with open(media_path, "rb") as fh:
-            data = fh.read()
-    except OSError:
-        shared.logger.warning("Не удалось прочитать медиа: %s", media_path)
+        client = _genai_sdk.Client(api_key=api_key)
+        uploaded = None
+        try:
+            if media_kind == "image":
+                media_part = _PILImage.open(media_path)
+            else:
+                uploaded = await client.aio.files.upload(
+                    file=media_path,
+                    config=_genai_types.UploadFileConfig(mime_type=media_mime),
+                )
+                media_part = uploaded
+            response = await client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[media_part, user_prompt],
+                config=_genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.7,
+                    max_output_tokens=500,
+                    safety_settings=_sdk_safety_settings(),
+                ),
+            )
+            return (response.text or "").strip() or None
+        finally:
+            if uploaded is not None:
+                with contextlib.suppress(Exception):
+                    await client.aio.files.delete(name=uploaded.name)
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "code", None) == 429:
+            _freeze_gemini_key(api_key)
+            shared.logger.warning(
+                "Gemini %s: квота (HTTP 429) — ключ заморожен на %s с",
+                GEMINI_MODEL, GEMINI_QUOTA_FREEZE_SEC,
+            )
+        else:
+            shared.logger.warning(
+                "Ошибка мультимодального вызова Gemini (%s): %s", GEMINI_MODEL, exc
+            )
         return None
-    return data, (media_mime or "application/octet-stream")
 
 
 async def _gemini_generate(
     system_prompt: str,
     user_prompt: str,
-    media: Optional[tuple[bytes, str]] = None,
+    media_path: Optional[str] = None,
+    media_mime: Optional[str] = None,
 ) -> Optional[str]:
     """Вызов Gemini с ротацией ключей.
 
@@ -346,61 +470,32 @@ async def _gemini_generate(
     ключи пропускаются молча — повторные ошибки квоты не спамят в логи.
     Если все ключи заморожены/недоступны — возвращает None, дальше сработает
     фоллбек на Groq.
-    media — кортеж (bytes, mime_type) для inline_data (фото/голосовое).
+
+    media_path/media_mime — временный файл медиа (фото/ГС). Без медиа — обычный
+    текстовый REST-запрос. С медиа — google-genai SDK: image через
+    PIL.Image.open, audio/ogg через files.upload (файл удаляется после ответа).
     """
     keys = _gemini_api_keys()
     if not keys:
         shared.logger.info("GEMINI_API_KEY не задана — пропускаем Gemini")
         return None
 
+    media_kind = _media_kind(media_path, media_mime)
+
     tried = False
     for api_key in keys:
         if _is_gemini_key_frozen(api_key):
             continue
         tried = True
-        parts: list[dict[str, Any]] = [{"text": user_prompt}]
-        if media:
-            data, mime = media
-            parts.append(
-                {
-                    "inline_data": {
-                        "mime_type": mime,
-                        "data": base64.b64encode(data).decode("ascii"),
-                    }
-                }
+        if media_kind:
+            text = await _gemini_call_with_media(
+                api_key, system_prompt, user_prompt, media_path, media_mime, media_kind
             )
-        body = {
-            "contents": [{"parts": parts}],
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "safetySettings": GEMINI_SAFETY,
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500},
-        }
-        try:
-            async with shared.http_session.post(
-                GEMINI_API_URL.format(model=GEMINI_MODEL),
-                params={"key": api_key},
-                json=body,
-                timeout=aiohttp.ClientTimeout(total=shared.CFG.ai_timeout),
-            ) as resp:
-                if resp.status == 429:
-                    _freeze_gemini_key(api_key)
-                    shared.logger.warning(
-                        "Gemini %s: квота (HTTP 429) — ключ заморожен на %s с",
-                        GEMINI_MODEL, GEMINI_QUOTA_FREEZE_SEC,
-                    )
-                    continue
-                if resp.status >= 400:
-                    err = (await resp.text(errors="replace"))[:300]
-                    shared.logger.warning("Gemini %s: HTTP %s %s", GEMINI_MODEL, resp.status, err)
-                    continue
-                data = await resp.json(content_type=None)
-        except Exception as exc:  # noqa: BLE001
-            shared.logger.warning("Ошибка обращения к Gemini (%s): %s", GEMINI_MODEL, exc)
-            continue
-        parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-        text = "\n".join(p.get("text", "") for p in parts).strip() or None
-        if text is not None:
-            _GEMINI_KEY_FAILURES.pop(api_key, None)
+        else:
+            text = await _gemini_call_text(api_key, system_prompt, user_prompt)
+        if text is None:
+            continue  # ошибка/квота — пробуем следующий ключ
+        _GEMINI_KEY_FAILURES.pop(api_key, None)
         return text
     if tried:
         shared.logger.info("Все ключи Gemini недоступны/в карантине — переключаемся на Groq")
@@ -447,22 +542,24 @@ async def _groq_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
 async def _generate_with_fallback(
     system_prompt: str,
     user_prompt: str,
-    media: Optional[tuple[bytes, str]] = None,
+    media_path: Optional[str] = None,
+    media_mime: Optional[str] = None,
 ) -> Optional[str]:
     """Gemini (с ротацией ключей), при лимитах/ошибках — автоматический фоллбек на Groq.
 
-    media — кортеж (bytes, mime_type): Gemini его видит; Groq (текстовая модель)
-    медиа не видит, поэтому в промпт добавляется пометка о наличии вложения.
+    media_path/media_mime — временный файл медиа (фото/ГС): Gemini видит его
+    содержимое (PIL Image / files.upload); Groq (текстовая модель) медиа не
+    видит, поэтому в промпт добавляется пометка о наличии вложения.
     """
     global _last_gemini_down_log
-    raw = await _gemini_generate(system_prompt, user_prompt, media)
+    raw = await _gemini_generate(system_prompt, user_prompt, media_path, media_mime)
     if raw is None:
         now = time.monotonic()
         if now - _last_gemini_down_log >= _GEMINI_DOWN_LOG_INTERVAL:
             _last_gemini_down_log = now
             shared.logger.info("Gemini недоступен/лимит — автоматический фоллбек на Groq")
         groq_prompt = user_prompt
-        if media:
+        if media_path and media_mime:
             groq_prompt += (
                 "\n\n[К сообщению прикреплено медиа (изображение/аудио), "
                 "которое модель не видит. Дай общий ответ по тексту.]"
@@ -491,9 +588,8 @@ async def generate_suggestions(
     media_path/media_mime — путь к временному файлу вложения (фото/ГС) и его
     MIME; Gemini видит содержимое, Groq — нет (только пометку).
     """
-    media = _read_media(media_path, media_mime)
     user_prompt = _build_user_prompt(text, peer_name, web_context, history, username)
-    if media:
+    if media_path and media_mime:
         user_prompt += (
             "\n\nСобеседник также прислал вложение (изображение/аудио) — "
             "учитывай его содержимое."
@@ -501,7 +597,8 @@ async def generate_suggestions(
     raw = await _generate_with_fallback(
         AI_SYSTEM_PROMPT + role_suffix,
         user_prompt,
-        media,
+        media_path=media_path,
+        media_mime=media_mime,
     )
     suggestions = _parse_suggestions(raw) if raw else []
     shared.logger.info("Сгенерировано вариантов ответа: %s", len(suggestions))
@@ -517,15 +614,28 @@ async def refine_draft(original: str, draft: str, instruction: str) -> Optional[
     return refined
 
 
-async def rewrite_draft(old_text: str, wish: str) -> Optional[str]:
+async def rewrite_draft(
+    old_text: str,
+    wish: str,
+    media_path: Optional[str] = None,
+    media_mime: Optional[str] = None,
+) -> Optional[str]:
     """Переписывает текст активного черновика по пожеланию пользователя.
 
     Используется при правке карточки предпросмотра прямой отправки
     (ACTIVE_DRAFT): пользователь просто пишет пожелание в чат управления,
     а ИИ переписывает уже сгенерированный текст.
+    media_path/media_mime — путь к временному файлу медиа (фото/ГС): Gemini
+    учитывает его содержимое при переписывании.
     """
     user_prompt = f"Перепиши текст. Исходный текст: '{old_text}'. Пожелание: '{wish}'"
-    rewritten = await _generate_with_fallback(REFINE_SYSTEM_PROMPT, user_prompt)
+    if media_path and media_mime:
+        user_prompt += (
+            "\n\nУчитывай также содержимое приложенного медиа (изображение/аудио)."
+        )
+    rewritten = await _generate_with_fallback(
+        REFINE_SYSTEM_PROMPT, user_prompt, media_path=media_path, media_mime=media_mime
+    )
     if rewritten:
         shared.logger.info("Черновик переписан по пожеланию: %s", wish[:60])
     return rewritten
@@ -563,9 +673,8 @@ async def generate_direct_send_text(
     media_path/media_mime — путь к временному файлу вложения (фото/ГС) и его
     MIME; Gemini видит содержимое и опирается на него.
     """
-    media = _read_media(media_path, media_mime)
     user_prompt = f"Тема: {topic}"
-    if media:
+    if media_path and media_mime:
         user_prompt += (
             "\n\nК запросу прикреплено вложение (изображение/аудио) — "
             "опирайся на его содержимое."
@@ -573,7 +682,8 @@ async def generate_direct_send_text(
     raw = await _generate_with_fallback(
         _DIRECT_SEND_SYSTEM_PROMPT,
         user_prompt,
-        media,
+        media_path=media_path,
+        media_mime=media_mime,
     )
     if raw:
         shared.logger.info("Сгенерировано сообщение для прямой отправки: %s", raw[:80])

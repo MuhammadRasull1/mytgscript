@@ -300,74 +300,70 @@ def _media_extension(mime: Optional[str]) -> str:
     }.get(mime or "", ".bin")
 
 
-async def _download_pyrogram_media(
-    message: Message,
-) -> tuple[Optional[str], Optional[str]]:
-    """Скачивает фото/ГС/аудио из Pyrogram-сообщения в data/tmp.
+async def _download_media(source: Any) -> tuple[Optional[str], Optional[str]]:
+    """Универсальная загрузка медиа (фото/ГС/аудио) в data/tmp.
+
+    Понимает оба режима по типу источника:
+    - Pyrogram Message (входящие ЛС): скачивает через message.download(file_name=...);
+    - dict сообщения Bot API (режим bot_chat): берёт file_id (photo[-1] / voice /
+      audio), запрашивает путь через bot_api.get_file(file_id) и скачивает байты
+      по URL в data/tmp.
 
     Возвращает (путь, mime_type) или (None, None), если медиа нет или скачивание
     не удалось (в этом случае файл чистится сразу и бот НЕ падает).
     """
+    is_bot_api = isinstance(source, dict)
     mime: Optional[str] = None
-    if message.photo:
-        mime = "image/jpeg"
-    elif message.voice:
-        mime = getattr(message.voice, "mime_type", None) or "audio/ogg"
-    elif message.audio:
-        mime = getattr(message.audio, "mime_type", None) or "audio/mpeg"
+    file_id: Optional[str] = None
+
+    if is_bot_api:
+        photos = source.get("photo") or []
+        if photos:
+            file_id = photos[-1].get("file_id")
+            mime = "image/jpeg"
+        elif source.get("voice"):
+            file_id = source["voice"].get("file_id")
+            mime = source["voice"].get("mime_type") or "audio/ogg"
+        elif source.get("audio"):
+            file_id = source["audio"].get("file_id")
+            mime = source["audio"].get("mime_type") or "audio/mpeg"
+        else:
+            return None, None
+        if not file_id:
+            logger.info("Получено медиа (%s), нет file_id — пропускаем", mime)
+            return None, None
     else:
+        if source.photo:
+            mime = "image/jpeg"
+        elif source.voice:
+            mime = getattr(source.voice, "mime_type", None) or "audio/ogg"
+        elif source.audio:
+            mime = getattr(source.audio, "mime_type", None) or "audio/mpeg"
+        else:
+            return None, None
+
+    if not mime:
         return None, None
+
     path: Optional[str] = None
     try:
         os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
         name = f"dl_{uuid.uuid4().hex}{_media_extension(mime)}"
         path = os.path.join(MEDIA_TMP_DIR, name)
-        downloaded = await message.download(file_name=path)
+        if is_bot_api:
+            file_info = await bot_api.get_file(file_id)
+            file_path = (file_info or {}).get("file_path")
+            if not file_path:
+                raise BotApiError("getFile не вернул file_path")
+            await bot_api.download_file(file_path, path)
+        else:
+            downloaded = await source.download(file_name=path)
+            if not downloaded:
+                logger.info("Получено медиа (%s), скачивание не удалось — пропускаем", mime)
+                _cleanup_temp_file(path)
+                return None, None
     except Exception:  # noqa: BLE001
         logger.exception("Получено медиа (%s), скачивание упало — пропускаем", mime)
-        _cleanup_temp_file(path)
-        return None, None
-    if not downloaded:
-        logger.info("Получено медиа (%s), скачивание не удалось — пропускаем", mime)
-        _cleanup_temp_file(path)
-        return None, None
-    return str(downloaded), mime
-
-
-async def _download_bot_api_media(msg: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-    """Скачивает фото/ГС/аудио из сообщения Bot API в data/tmp.
-
-    Возвращает (путь, mime_type) или (None, None), если медиа нет или скачивание
-    не удалось (в этом случае файл чистится сразу).
-    """
-    file_id: Optional[str] = None
-    mime: Optional[str] = None
-    photos = msg.get("photo") or []
-    if photos:
-        file_id = photos[-1].get("file_id")
-        mime = "image/jpeg"
-    elif msg.get("voice"):
-        file_id = msg["voice"].get("file_id")
-        mime = msg["voice"].get("mime_type") or "audio/ogg"
-    elif msg.get("audio"):
-        file_id = msg["audio"].get("file_id")
-        mime = msg["audio"].get("mime_type") or "audio/mpeg"
-    else:
-        return None, None
-    if not file_id:
-        logger.info("Получено медиа (%s), нет file_id — пропускаем", mime)
-        return None, None
-    os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
-    name = f"dl_{uuid.uuid4().hex}{_media_extension(mime)}"
-    path = os.path.join(MEDIA_TMP_DIR, name)
-    try:
-        file_info = await bot_api.get_file(file_id)
-        file_path = (file_info or {}).get("file_path")
-        if not file_path:
-            raise BotApiError("getFile не вернул file_path")
-        await bot_api.download_file(file_path, path)
-    except Exception:  # noqa: BLE001
-        logger.exception("Получено медиа (%s), скачивание из Bot API упало — пропускаем", mime)
         _cleanup_temp_file(path)
         return None, None
     return path, mime
@@ -393,7 +389,14 @@ async def handle_incoming(message: Message) -> None:
     ):
         draft = ACTIVE_DRAFT.get("current") or ACTIVE_DRAFT.get(owner_id)
         if draft is not None:
-            new_text = await rewrite_draft(draft["text"], raw_text)
+            media_path, media_mime = await _download_media(message)
+            try:
+                new_text = await rewrite_draft(
+                    draft["text"], raw_text,
+                    media_path=media_path, media_mime=media_mime,
+                )
+            finally:
+                _cleanup_temp_file(media_path)
             if new_text:
                 draft["text"] = new_text
                 buttons = [
@@ -430,7 +433,7 @@ async def handle_incoming(message: Message) -> None:
 
     intent = detect_direct_send_intent(raw_text)
     if intent is not None and message.chat.id == service_chat_id:
-        media_path, media_mime = await _download_pyrogram_media(message)
+        media_path, media_mime = await _download_media(message)
         try:
             chat_id, target_name = await _resolve_chat(intent.target)
             if chat_id is None:
@@ -494,7 +497,7 @@ async def handle_incoming(message: Message) -> None:
     if peer is None:
         return
 
-    media_path, media_mime = await _download_pyrogram_media(message)
+    media_path, media_mime = await _download_media(message)
 
     payload: dict[str, Any] = {
         "event": "incoming_message",
@@ -1297,7 +1300,14 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
     if text and not lower.startswith(("напиши", "отправь", "удали", "/")):
         draft = ACTIVE_DRAFT.get("current") or ACTIVE_DRAFT.get(owner_id)
         if draft is not None:
-            new_text = await rewrite_draft(draft["text"], text)
+            media_path, media_mime = await _download_media(msg)
+            try:
+                new_text = await rewrite_draft(
+                    draft["text"], text,
+                    media_path=media_path, media_mime=media_mime,
+                )
+            finally:
+                _cleanup_temp_file(media_path)
             if not new_text:
                 await bot_api.send_message(
                     owner_id, "⚠️ Не удалось переписать текст. Попробуйте ещё раз."
@@ -1409,7 +1419,7 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
 
     intent = detect_direct_send_intent(text)
     if intent is not None:
-        media_path, media_mime = await _download_bot_api_media(msg)
+        media_path, media_mime = await _download_media(msg)
         try:
             chat_id, target_name = await _resolve_chat(intent.target)
             if chat_id is None:

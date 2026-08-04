@@ -2,6 +2,10 @@ pyrogram>=2.0.106
 aiohttp>=3.9.5
 python-dotenv>=1.0.1
 ddgs>=9.0.0
+# Мультимодальность (фото/ГС -> Gemini): Pillow открывает картинку,
+# google-genai — официальный SDK с files.upload для аудио
+google-genai>=1.0.0
+Pillow>=10.0.0
 # duckduckgo_search переименован в ddgs: старый пакет кидает RuntimeWarning и не обновляется
 # Telegram Bot API (@myaccounttbot) обслуживается через aiohttp (bot_api.py) —
 # новых зависимостей не требуется

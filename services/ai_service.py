@@ -455,6 +455,20 @@ async def refine_draft(original: str, draft: str, instruction: str) -> Optional[
     return refined
 
 
+async def rewrite_draft(old_text: str, wish: str) -> Optional[str]:
+    """Переписывает текст активного черновика по пожеланию пользователя.
+
+    Используется при правке карточки предпросмотра прямой отправки
+    (ACTIVE_DRAFT): пользователь просто пишет пожелание в чат управления,
+    а ИИ переписывает уже сгенерированный текст.
+    """
+    user_prompt = f"Перепиши текст. Старый текст: '{old_text}'. Пожелание: '{wish}'"
+    rewritten = await _generate_with_fallback(REFINE_SYSTEM_PROMPT, user_prompt)
+    if rewritten:
+        shared.logger.info("Черновик переписан по пожеланию: %s", wish[:60])
+    return rewritten
+
+
 async def generate_content(instruction: str) -> list[str]:
     """Генерация 3 готовых текстов по произвольному запросу (команда /con)."""
     raw = await _generate_with_fallback(

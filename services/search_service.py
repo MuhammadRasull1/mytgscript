@@ -125,19 +125,15 @@ def _format_search_results(results: list[dict]) -> str:
 
 
 async def _run_web_search(query: str) -> list[dict]:
-    """Поиск в интернете (duckduckgo_search) в отдельном потоке, с фоллбек-бэкендами."""
+    """Поиск в интернете (ddgs) в отдельном потоке, с фоллбек-бэкендами."""
     if not query.strip():
         return []
 
     def _do() -> list[dict]:
         try:
-            import warnings
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                from duckduckgo_search import DDGS
+            from ddgs import DDGS
         except Exception as exc:  # noqa: BLE001
-            shared.logger.warning("duckduckgo_search не установлен — поиск недоступен: %s", exc)
+            shared.logger.warning("ddgs не установлен — поиск недоступен: %s", exc)
             return []
         with DDGS() as ddgs:
             for backend in WEB_SEARCH_BACKENDS:
@@ -205,7 +201,7 @@ async def _wikipedia_context(query: str) -> str:
 async def _web_search_context(peer: Any, text: str) -> str:
     """Возвращает результаты поиска для промпта, если они нужны собеседнику.
 
-    Сначала duckduckgo_search (несколько бэкендов), при пустом результате —
+    Сначала ddgs (несколько бэкендов), при пустом результате —
     фоллбек на Википедию, чтобы точные ответы не зависели от лимитов поисковика.
     """
     if not _peer_has_internet(peer) or not _needs_web_search(text):

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -17,6 +18,10 @@ from services.shared import shared
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# На сколько секунд замораживать ключ Gemini после ошибки квоты (429)
+GEMINI_QUOTA_FREEZE_SEC = int(os.getenv("GEMINI_QUOTA_FREEZE_SEC", "600"))
+# Как часто логировать общую недоступность Gemini (чтобы не спамить)
+_GEMINI_DOWN_LOG_INTERVAL = 300
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models"
     "/{model}:generateContent"
@@ -181,35 +186,89 @@ def _parse_suggestions(raw: str) -> list[str]:
     return out
 
 
+# --- Карантин ключей Gemini (HTTP 429/квота) ---
+# api_key -> монотонное время (time.monotonic()), до которого ключ заморожен
+_GEMINI_KEY_FAILURES: dict[str, float] = {}
+# монотонное время последнего инфо-лога о недоступности Gemini целиком
+_last_gemini_down_log: float = 0.0
+
+
+def _gemini_api_keys() -> list[str]:
+    """Все ключи Gemini из env: GEMINI_API_KEY, GEMINI_API_KEY_2, ..."""
+    keys = [
+        os.getenv("GEMINI_API_KEY"),
+        os.getenv("GEMINI_API_KEY_2"),
+        os.getenv("GEMINI_API_KEY_3"),
+    ]
+    return [k for k in keys if k]
+
+
+def _is_gemini_key_frozen(api_key: str) -> bool:
+    """Заморожен ли ключ из-за квоты (попытки не возобновляем до разморозки)."""
+    until = _GEMINI_KEY_FAILURES.get(api_key)
+    return until is not None and until > time.monotonic()
+
+
+def _freeze_gemini_key(api_key: str) -> None:
+    """Замораживает ключ на GEMINI_QUOTA_FREEZE_SEC (по умолчанию 10 минут)."""
+    _GEMINI_KEY_FAILURES[api_key] = time.monotonic() + GEMINI_QUOTA_FREEZE_SEC
+
+
 async def _gemini_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
-    """Вызов Gemini. Возвращает текст ответа или None при ошибке/лимите."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    """Вызов Gemini с ротацией ключей.
+
+    При HTTP 429 (квота) ключ МГНОВЕННО замораживается на 10 минут, а запрос
+    сразу же уходит на следующий ключ (GEMINI_API_KEY_2, ...). Замороженные
+    ключи пропускаются молча — повторные ошибки квоты не спамят в логи.
+    Если все ключи заморожены/недоступны — возвращает None, дальше сработает
+    фоллбек на Groq.
+    """
+    keys = _gemini_api_keys()
+    if not keys:
         shared.logger.info("GEMINI_API_KEY не задана — пропускаем Gemini")
         return None
-    body = {
-        "contents": [{"parts": [{"text": user_prompt}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "safetySettings": GEMINI_SAFETY,
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500},
-    }
-    try:
-        async with shared.http_session.post(
-            GEMINI_API_URL.format(model=GEMINI_MODEL),
-            params={"key": api_key},
-            json=body,
-            timeout=aiohttp.ClientTimeout(total=shared.CFG.ai_timeout),
-        ) as resp:
-            if resp.status >= 400:
-                err = (await resp.text(errors="replace"))[:300]
-                shared.logger.warning("Gemini %s: HTTP %s %s", GEMINI_MODEL, resp.status, err)
-                return None
-            data = await resp.json(content_type=None)
-    except Exception as exc:  # noqa: BLE001
-        shared.logger.warning("Ошибка обращения к Gemini (%s): %s", GEMINI_MODEL, exc)
-        return None
-    parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
-    return "\n".join(p.get("text", "") for p in parts).strip() or None
+
+    tried = False
+    for api_key in keys:
+        if _is_gemini_key_frozen(api_key):
+            continue
+        tried = True
+        body = {
+            "contents": [{"parts": [{"text": user_prompt}]}],
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "safetySettings": GEMINI_SAFETY,
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500},
+        }
+        try:
+            async with shared.http_session.post(
+                GEMINI_API_URL.format(model=GEMINI_MODEL),
+                params={"key": api_key},
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=shared.CFG.ai_timeout),
+            ) as resp:
+                if resp.status == 429:
+                    _freeze_gemini_key(api_key)
+                    shared.logger.warning(
+                        "Gemini %s: квота (HTTP 429) — ключ заморожен на %s с",
+                        GEMINI_MODEL, GEMINI_QUOTA_FREEZE_SEC,
+                    )
+                    continue
+                if resp.status >= 400:
+                    err = (await resp.text(errors="replace"))[:300]
+                    shared.logger.warning("Gemini %s: HTTP %s %s", GEMINI_MODEL, resp.status, err)
+                    continue
+                data = await resp.json(content_type=None)
+        except Exception as exc:  # noqa: BLE001
+            shared.logger.warning("Ошибка обращения к Gemini (%s): %s", GEMINI_MODEL, exc)
+            continue
+        parts = ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        text = "\n".join(p.get("text", "") for p in parts).strip() or None
+        if text is not None:
+            _GEMINI_KEY_FAILURES.pop(api_key, None)
+        return text
+    if tried:
+        shared.logger.info("Все ключи Gemini недоступны/в карантине — переключаемся на Groq")
+    return None
 
 
 async def _groq_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
@@ -250,10 +309,14 @@ async def _groq_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
 
 
 async def _generate_with_fallback(system_prompt: str, user_prompt: str) -> Optional[str]:
-    """Gemini, при лимитах/ошибках — автоматический фоллбек на Groq."""
+    """Gemini (с ротацией ключей), при лимитах/ошибках — автоматический фоллбек на Groq."""
+    global _last_gemini_down_log
     raw = await _gemini_generate(system_prompt, user_prompt)
     if raw is None:
-        shared.logger.info("Gemini недоступен/лимит — автоматический фоллбек на Groq")
+        now = time.monotonic()
+        if now - _last_gemini_down_log >= _GEMINI_DOWN_LOG_INTERVAL:
+            _last_gemini_down_log = now
+            shared.logger.info("Gemini недоступен/лимит — автоматический фоллбек на Groq")
         raw = await _groq_generate(system_prompt, user_prompt)
     return raw
 

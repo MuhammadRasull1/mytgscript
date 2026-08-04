@@ -181,10 +181,11 @@ async def healthcheck_server() -> None:
         app = web.Application()
 
         async def handler(request):  # noqa: ARG001
-            return web.Response(text="OK")
+            return web.Response(text="OK", status=200)
 
         app.router.add_get("/", handler)
         app.router.add_get("/health", handler)
+        app.router.add_get("/healthcheck", handler)
 
         runner = web.AppRunner(app)
         await runner.setup()

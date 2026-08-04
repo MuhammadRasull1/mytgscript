@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -15,6 +16,39 @@ from typing import Any, Optional
 import aiohttp
 
 from services.shared import shared
+
+# --- Прямая отправка сообщений: распознавание намерения ---
+
+_SEND_DIRECT_RE = re.compile(
+    r"^(?:напиши\s+в\s+группу|отправь)\s+(@\S+|\d+)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class Intent:
+    """Распознанное намерение пользователя."""
+
+    action: str
+    target: str
+    text: str
+
+
+def detect_direct_send_intent(text: str) -> Optional[Intent]:
+    """Определяет намерение «написать напрямую» по тексту сообщения.
+
+    Поддерживаемые форматы:
+      «Напиши в группу @username текст»
+      «Напиши в группу НазваниеГруппы текст»
+      «Отправь @username текст»
+      «Отправь 123456 текст»
+
+    Возвращает Intent(action="send_direct") или None.
+    """
+    m = _SEND_DIRECT_RE.match(text.strip())
+    if not m:
+        return None
+    return Intent(action="send_direct", target=m.group(1), text=m.group(2).strip())
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")

@@ -75,7 +75,15 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger("userbot")
 
 # --- Сервисные модули (роли, поиск, ИИ, /con) ---
-from services.ai_service import EditCtx, _dialog_history_block, _push_dialog, generate_suggestions, refine_draft
+from services.ai_service import (
+    EditCtx,
+    Intent,
+    _dialog_history_block,
+    _push_dialog,
+    detect_direct_send_intent,
+    generate_suggestions,
+    refine_draft,
+)
 from services.con_handler import (
     GenCtx,
     _handle_gen_callback,
@@ -263,6 +271,16 @@ async def handle_incoming(message: Message) -> None:
     )
     # Отсечка: не обрабатываем собственные исходящие сообщения (с других устройств)
     if message.from_user and message.from_user.is_self:
+        return
+    intent = detect_direct_send_intent((message.text or message.caption or "").strip())
+    if intent is not None and message.chat.id == service_chat_id:
+        name = await _handle_direct_send(intent.target, intent.text)
+        if name:
+            await message.reply(f"✅ Сообщение отправлено в {esc_html(name)}")
+        else:
+            await message.reply(
+                f"⚠️ Не удалось найти чат/группу «{esc_html(intent.target)}»."
+            )
         return
     if message.chat.id == service_chat_id:
         return  # не обрабатываем собственный служебный чат
@@ -796,6 +814,48 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
         )
 
 
+async def _resolve_chat(target: str) -> Optional[tuple[int, str]]:
+    """Пытается найти чат/группу по @username, числовому ID или названию.
+
+    Возвращает (chat_id, display_name) или None.
+    """
+    try:
+        if target.startswith("@"):
+            username = target[1:].lower()
+            try:
+                user = await client.get_users(username)
+                return user.id, user.username or user.first_name or f"@{username}"
+            except Exception:  # noqa: BLE001
+                return None, ""
+        if target.lstrip("-").isdigit():
+            chat = await client.get_chat(int(target))
+            return chat.id, chat.title or str(chat.id)
+        dialogs = await client.get_dialogs()
+        for d in dialogs:
+            title = getattr(d, "title", None) or ""
+            if title.lower() == target.lower():
+                return d.id, title
+        return None, ""
+    except Exception:  # noqa: BLE001
+        return None, ""
+
+
+async def _handle_direct_send(target: str, text: str) -> Optional[str]:
+    """Отправляет текст напрямую в указанный чат/группу.
+
+    Возвращает имя чата при успехе или None при ошибке.
+    """
+    chat_id, name = await _resolve_chat(target)
+    if chat_id is None:
+        return None
+    try:
+        await client.send_message(chat_id, text)
+        return name
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось отправить сообщение в чат %s", target)
+        return None
+
+
 async def bot_handle_message(msg: dict[str, Any]) -> None:
     """Сообщения владельца в чате с ботом: команды, контакт/правка для /con, правка черновика."""
     if (msg.get("from") or {}).get("id") != owner_id:
@@ -882,6 +942,18 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
             await _set_internet_flag(arg.split(None, 1)[0], False)
             return
         await bot_api.send_message(owner_id, "Неизвестная команда. Наберите /help для списка команд.")
+        return
+
+    intent = detect_direct_send_intent(text)
+    if intent is not None:
+        name = await _handle_direct_send(intent.target, intent.text)
+        if name:
+            await bot_api.send_message(owner_id, f"✅ Сообщение отправлено в {esc_html(name)}")
+        else:
+            await bot_api.send_message(
+                owner_id,
+                f"⚠️ Не удалось найти чат/группу «{esc_html(intent.target)}».",
+            )
         return
 
     if not text or not bot_msg_id:

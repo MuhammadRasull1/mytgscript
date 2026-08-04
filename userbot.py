@@ -181,10 +181,10 @@ GEN_CTX: dict[int, GenCtx] = {}
 # Preview contexts for direct send (preview_msg_id -> {target, text, target_name})
 DIRECT_SEND_CTX: dict[int, dict] = {}
 
-# Активные черновики прямой отправки (control_chat_id -> {target, text, msg_id}).
+# Активные черновики прямой отправки ("current" -> {target, text, msg_id}).
 # Пока черновик активен, любое простое сообщение в чате управления
 # интерпретируется как пожелание переписать текст черновика.
-ACTIVE_DRAFT: dict[int, dict] = {}
+ACTIVE_DRAFT: dict[Any, dict] = {}
 # Sent message contexts for delete button (sent_msg_id -> {recipient_chat_id, recipient_msg_id})
 SENT_MSG_CTX: dict[int, dict] = {}
 
@@ -285,7 +285,55 @@ async def handle_incoming(message: Message) -> None:
     # Отсечка: не обрабатываем собственные исходящие сообщения (с других устройств)
     if message.from_user and message.from_user.is_self:
         return
-    intent = detect_direct_send_intent((message.text or message.caption or "").strip())
+    raw_text = (message.text or message.caption or "").strip()
+    lower = raw_text.lower()
+
+    # Правка активного черновика ПЕРВОЙ: простое сообщение (не "напиши/отправь/
+    # удали" и не команда) в управляющем чате, пока есть активный черновик —
+    # переписываем текст и редактируем СТАРУЮ карточку предпросмотра.
+    if (
+        message.chat.id == service_chat_id
+        and lower
+        and not lower.startswith(("напиши", "отправь", "удали", "/"))
+    ):
+        draft = ACTIVE_DRAFT.get("current") or ACTIVE_DRAFT.get(owner_id)
+        if draft is not None:
+            new_text = await rewrite_draft(draft["text"], raw_text)
+            if new_text:
+                draft["text"] = new_text
+                buttons = [
+                    [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{draft['target']}|{new_text[:80]}"}],
+                    [{"text": "✏️ Редактировать", "callback_data": f"dedit|{draft['target']}|{new_text[:80]}"}],
+                    [{"text": "❌ Отмена", "callback_data": f"dcancel|{draft['target']}|{new_text[:80]}"}],
+                ]
+                body = (
+                    f"✅ Применил: «{esc_html(raw_text)}»\n\n"
+                    "📝 Предпросмотр сообщения для <b>"
+                    f"{esc_html(draft['target'])}</b>:\n\n"
+                    f"{esc_html(new_text[:500])}"
+                )
+                try:
+                    await client.edit_message_text(
+                        service_chat_id, draft["msg_id"], body,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup(
+                            {"inline_keyboard": buttons}
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Не удалось отредактировать карточку предпросмотра")
+                    await client.send_message(
+                        service_chat_id,
+                        "⚠️ Не удалось обновить предпросмотр. Попробуйте ещё раз.",
+                    )
+            else:
+                await client.send_message(
+                    service_chat_id,
+                    "⚠️ Не удалось переписать текст. Попробуйте ещё раз.",
+                )
+            return  # Завершаем обработку
+
+    intent = detect_direct_send_intent(raw_text)
     if intent is not None and message.chat.id == service_chat_id:
         chat_id, target_name = await _resolve_chat(intent.target)
         if chat_id is None:
@@ -324,7 +372,7 @@ async def handle_incoming(message: Message) -> None:
             "target_name": target_name,
             "chat_id": chat_id,
         }
-        ACTIVE_DRAFT[owner_id] = {
+        ACTIVE_DRAFT["current"] = {
             "target": intent.target,
             "text": send_text,
             "msg_id": preview_msg_id,
@@ -332,46 +380,6 @@ async def handle_incoming(message: Message) -> None:
         }
         return
     if message.chat.id == service_chat_id:
-        # Правка активного черновика: простое сообщение (не "напиши/отправь/
-        # удали" и не команда), пока есть активный черновик — переписываем
-        # текст и редактируем СТАРУЮ карточку предпросмотра, не создавая новую.
-        draft = ACTIVE_DRAFT.get(owner_id)
-        raw_text = (message.text or message.caption or "").strip()
-        lower = raw_text.lower()
-        if draft is not None and lower and not lower.startswith(("напиши", "отправь", "удали", "/")):
-            new_text = await rewrite_draft(draft["text"], raw_text)
-            if new_text:
-                draft["text"] = new_text
-                buttons = [
-                    [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{draft['target']}|{new_text[:80]}"}],
-                    [{"text": "✏️ Редактировать", "callback_data": f"dedit|{draft['target']}|{new_text[:80]}"}],
-                    [{"text": "❌ Отмена", "callback_data": f"dcancel|{draft['target']}|{new_text[:80]}"}],
-                ]
-                body = (
-                    f"✅ Применил: «{esc_html(raw_text)}»\n\n"
-                    "📝 Предпросмотр сообщения для <b>"
-                    f"{esc_html(draft['target'])}</b>:\n\n"
-                    f"{esc_html(new_text[:500])}"
-                )
-                try:
-                    await client.edit_message_text(
-                        service_chat_id, draft["msg_id"], body,
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup(
-                            {"inline_keyboard": buttons}
-                        ),
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception("Не удалось отредактировать карточку предпросмотра")
-                    await client.send_message(
-                        service_chat_id,
-                        "⚠️ Не удалось обновить предпросмотр. Попробуйте ещё раз.",
-                    )
-            else:
-                await client.send_message(
-                    service_chat_id,
-                    "⚠️ Не удалось переписать текст. Попробуйте ещё раз.",
-                )
         return  # не обрабатываем собственный служебный чат
     # В режиме bot_chat игнорируем сообщения управляющего бота: иначе его кнопки
     # ушли бы в генерацию ИИ как «входящее ЛС» и породили бы бесконечный цикл
@@ -719,7 +727,7 @@ async def handle_callback(cb: CallbackQuery) -> None:
             await _safe_answer(cb, "⚠️ Не удалось отправить")
             return
         DIRECT_SEND_CTX.pop(message_id, None)
-        ACTIVE_DRAFT.pop(owner_id, None)
+        ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
         _push_dialog(chat_id, "me", send_text)
         await _safe_answer(cb, "Отправлено ✅")
         await _replace_buttons_with_status(
@@ -756,7 +764,7 @@ async def handle_callback(cb: CallbackQuery) -> None:
     if action.startswith("dcancel|"):
         await _safe_answer(cb, "Отменено ❌")
         DIRECT_SEND_CTX.pop(message_id, None)
-        ACTIVE_DRAFT.pop(owner_id, None)
+        ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
         await _replace_buttons_with_status(cb, "❌ Отменено")
         return
 
@@ -996,7 +1004,7 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
             await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить")
             return
         DIRECT_SEND_CTX.pop(message_id, None)
-        ACTIVE_DRAFT.pop(owner_id, None)
+        ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
         _push_dialog(chat_id2, "me", send_text)
         await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
         await bot_edit_with_status(
@@ -1038,7 +1046,7 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
     if action.startswith("dcancel|"):
         await bot_api.answer_callback_query(cb_id, "Отменено ❌")
         DIRECT_SEND_CTX.pop(message_id, None)
-        ACTIVE_DRAFT.pop(owner_id, None)
+        ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
         await bot_edit_with_status(chat_id, message_id, base, "❌ Отменено")
         return
 
@@ -1165,6 +1173,43 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
     reply_to = msg.get("reply_to_message") or {}
     bot_msg_id = reply_to.get("message_id")
 
+    # Правка активного черновика ПЕРВОЙ: простое сообщение (не "напиши/отправь/
+    # удали" и не команда), пока есть активный черновик — переписываем текст и
+    # редактируем СТАРУЮ карточку предпросмотра, не создавая новую.
+    lower = text.lower()
+    if text and not lower.startswith(("напиши", "отправь", "удали", "/")):
+        draft = ACTIVE_DRAFT.get("current") or ACTIVE_DRAFT.get(owner_id)
+        if draft is not None:
+            new_text = await rewrite_draft(draft["text"], text)
+            if not new_text:
+                await bot_api.send_message(
+                    owner_id, "⚠️ Не удалось переписать текст. Попробуйте ещё раз."
+                )
+                return
+            draft["text"] = new_text
+            buttons = [
+                [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{draft['target']}|{new_text[:80]}"}],
+                [{"text": "✏️ Редактировать", "callback_data": f"dedit|{draft['target']}|{new_text[:80]}"}],
+                [{"text": "❌ Отмена", "callback_data": f"dcancel|{draft['target']}|{new_text[:80]}"}],
+            ]
+            body = (
+                f"✅ Применил: «{esc_html(text)}»\n\n"
+                "📝 Предпросмотр сообщения для <b>"
+                f"{esc_html(draft['target'])}</b>:\n\n"
+                f"{esc_html(new_text[:500])}"
+            )
+            try:
+                await bot_api.edit_message_text(
+                    owner_id, draft["msg_id"], body, parse_mode="HTML",
+                    reply_markup={"inline_keyboard": buttons},
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось отредактировать карточку предпросмотра")
+                await bot_api.send_message(
+                    owner_id, "⚠️ Не удалось обновить предпросмотр. Попробуйте ещё раз."
+                )
+            return  # Завершаем обработку
+
     if "/cancel" in text:
         removed = False
         if bot_msg_id:
@@ -1245,42 +1290,6 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
         await bot_api.send_message(owner_id, "Неизвестная команда. Наберите /help для списка команд.")
         return
 
-    # Правка активного черновика: простое сообщение (не "напиши/отправь/удали"
-    # и не команда), пока есть активный черновик — переписываем текст и
-    # редактируем СТАРУЮ карточку предпросмотра, не создавая новую.
-    lower = text.lower()
-    draft = ACTIVE_DRAFT.get(owner_id)
-    if draft is not None and text and not lower.startswith(("напиши", "отправь", "удали", "/")):
-        new_text = await rewrite_draft(draft["text"], text)
-        if not new_text:
-            await bot_api.send_message(
-                owner_id, "⚠️ Не удалось переписать текст. Попробуйте ещё раз."
-            )
-            return
-        draft["text"] = new_text
-        buttons = [
-            [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{draft['target']}|{new_text[:80]}"}],
-            [{"text": "✏️ Редактировать", "callback_data": f"dedit|{draft['target']}|{new_text[:80]}"}],
-            [{"text": "❌ Отмена", "callback_data": f"dcancel|{draft['target']}|{new_text[:80]}"}],
-        ]
-        body = (
-            f"✅ Применил: «{esc_html(text)}»\n\n"
-            "📝 Предпросмотр сообщения для <b>"
-            f"{esc_html(draft['target'])}</b>:\n\n"
-            f"{esc_html(new_text[:500])}"
-        )
-        try:
-            await bot_api.edit_message_text(
-                owner_id, draft["msg_id"], body, parse_mode="HTML",
-                reply_markup={"inline_keyboard": buttons},
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось отредактировать карточку предпросмотра")
-            await bot_api.send_message(
-                owner_id, "⚠️ Не удалось обновить предпросмотр. Попробуйте ещё раз."
-            )
-        return
-
     intent = detect_direct_send_intent(text)
     if intent is not None:
         chat_id, target_name = await _resolve_chat(intent.target)
@@ -1319,7 +1328,7 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
             "target_name": target_name,
             "chat_id": chat_id,
         }
-        ACTIVE_DRAFT[owner_id] = {
+        ACTIVE_DRAFT["current"] = {
             "target": intent.target,
             "text": send_text,
             "msg_id": preview_msg_id,

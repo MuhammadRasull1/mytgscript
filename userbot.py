@@ -281,10 +281,15 @@ _load_auto_users()
 # Папка для временных файлов медиа (фото/ГС), отправляемых в Gemini
 MEDIA_TMP_DIR = os.path.join("data", "tmp")
 
+# Реестр ещё не удалённых временных медиафайлов: позволяет crash-guard'у в
+# finally подмести «хвосты», если какой-то путь обработки пропустил очистку.
+_ACTIVE_TEMP_FILES: set[str] = set()
+
 
 def _cleanup_temp_file(path: Optional[str]) -> None:
     """Удаляет временный файл медиа (безопасно, при любом исходе)."""
     if path:
+        _ACTIVE_TEMP_FILES.discard(path)
         with contextlib.suppress(OSError):
             os.remove(path)
 
@@ -366,6 +371,7 @@ async def _download_media(source: Any) -> tuple[Optional[str], Optional[str]]:
         logger.exception("Получено медиа (%s), скачивание упало — пропускаем", mime)
         _cleanup_temp_file(path)
         return None, None
+    _ACTIVE_TEMP_FILES.add(path)
     return path, mime
 
 
@@ -994,11 +1000,32 @@ HELP_TEXT = (
 
 
 async def bot_handle_update(update: dict[str, Any]) -> None:
-    """Точка входа для обновлений из long-polling бота."""
+    """Точка входа для обновлений из long-polling бота.
+
+    Железобетонный предохранитель: любая ошибка при обработке обновления
+    логируется и уходит владельцу («⚠️ Ошибка обработки: …»), но процесс
+    никогда не падает. В finally вычищаются временные медиафайлы, скачанные
+    во время обработки этого обновления (страховка поверх per-site finally).
+    """
     if "callback_query" in update:
-        await bot_handle_callback(update["callback_query"])
-    elif "message" in update:
+        try:
+            await bot_handle_callback(update["callback_query"])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка обработки: %s", exc)
+            with contextlib.suppress(Exception):
+                await notify_owner(f"⚠️ Ошибка обработки: {exc}")
+        return
+
+    before = set(_ACTIVE_TEMP_FILES)
+    try:
         await bot_handle_message(update["message"])
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ошибка обработки: %s", exc)
+        with contextlib.suppress(Exception):
+            await notify_owner(f"⚠️ Ошибка обработки: {exc}")
+    finally:
+        for path in set(_ACTIVE_TEMP_FILES) - before:
+            _cleanup_temp_file(path)
 
 
 async def bot_handle_callback(cb: dict[str, Any]) -> None:
@@ -1389,7 +1416,7 @@ async def _bot_handle_message(msg: dict[str, Any]) -> None:
         await bot_api.send_message(owner_id, "Отменено ✅")
         return
 
-    if text.startswith("/"):
+    if text and text.startswith("/"):
         parts = text.split(None, 1)
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""

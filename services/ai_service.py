@@ -91,6 +91,31 @@ def detect_direct_send_intent(text: str) -> Optional[Intent]:
         return None
     return Intent(action="send_direct", target=parts[0], text=parts[1].strip())
 
+_DELETE_INTENT_RE = re.compile(
+    r"^удали\s+(\d+)?\s*(?:последнее|последних)?\s*(?:сообщение|сообщения|сообщений)?\s*(?:у|пользователю)\s+(.+)$",
+    re.IGNORECASE,
+)
+
+
+def detect_delete_intent(text: str) -> Optional[dict]:
+    """Определяет намерение удаления последних сообщений у собеседника.
+
+    Поддерживаемые форматы:
+      «удали последнее сообщение у Улу»
+      «удали 3 последних сообщения у @username»
+      «удали последние сообщения у пользователя Улу»
+
+    Возвращает {"action": "delete", "count": N, "target": name} или None.
+    """
+    m = _DELETE_INTENT_RE.match(text.strip())
+    if not m:
+        return None
+    count_str = m.group(1)
+    target = m.group(2).strip()
+    count = int(count_str) if count_str else 1
+    return {"action": "delete", "count": count, "target": target}
+
+
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 # На сколько секунд замораживать ключ Gemini после ошибки квоты (429)

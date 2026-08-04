@@ -81,6 +81,7 @@ from services.ai_service import (
     _dialog_history_block,
     _push_dialog,
     detect_direct_send_intent,
+    detect_delete_intent,
     generate_suggestions,
     refine_draft,
 )
@@ -174,6 +175,11 @@ IN_FLIGHT: set[tuple[int, int]] = set()
 
 # message_id сообщения-результата /con -> контекст генератора
 GEN_CTX: dict[int, GenCtx] = {}
+
+# Preview contexts for direct send (preview_msg_id -> {target, text, target_name})
+DIRECT_SEND_CTX: dict[int, dict] = {}
+# Sent message contexts for delete button (sent_msg_id -> {recipient_chat_id, recipient_msg_id})
+SENT_MSG_CTX: dict[int, dict] = {}
 
 # --- Автопилот: контакты (@username или id), отвечаем без кнопок ---
 AUTO_USERS_FILE = os.path.join("data", "auto_users.json")
@@ -274,13 +280,39 @@ async def handle_incoming(message: Message) -> None:
         return
     intent = detect_direct_send_intent((message.text or message.caption or "").strip())
     if intent is not None and message.chat.id == service_chat_id:
-        name = await _handle_direct_send(intent.target, intent.text)
-        if name:
-            await message.reply(f"✅ Сообщение отправлено в {esc_html(name)}")
-        else:
+        chat_id, target_name = await _resolve_chat(intent.target)
+        if chat_id is None:
             await message.reply(
-                f"⚠️ Не удалось найти чат/группу «{esc_html(intent.target)}»."
+                f"❌ Не нашёл контакт/чат с именем «{esc_html(intent.target)}»."
             )
+            return
+        # Show preview with buttons instead of sending immediately
+        buttons = [
+            [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{intent.target}|{intent.text[:80]}"}],
+            [{"text": "✏️ Редактировать", "callback_data": f"dedit|{intent.target}|{intent.text[:80]}"}],
+            [{"text": "❌ Отмена", "callback_data": f"dcancel|{intent.target}|{intent.text[:80]}"}],
+        ]
+        body = (
+            "📝 Предпросмотр сообщения для <b>"
+            f"{esc_html(target_name)}</b>:\n\n"
+            f"{esc_html(intent.text[:500])}"
+        )
+        try:
+            sent = await client.send_message(
+                service_chat_id, body, parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    {"inline_keyboard": buttons}
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось отправить предпросмотр")
+            return
+        DIRECT_SEND_CTX[sent.id] = {
+            "target": intent.target,
+            "text": intent.text,
+            "target_name": target_name,
+            "chat_id": chat_id,
+        }
         return
     if message.chat.id == service_chat_id:
         return  # не обрабатываем собственный служебный чат
@@ -613,6 +645,73 @@ async def handle_callback(cb: CallbackQuery) -> None:
             cb, f"✅ Отправлено для {peer_name}: \"{variant}\""
         )
 
+    if action.startswith("dsend|"):
+        _, target, text = action.split("|", 2)
+        chat_id, target_name = await _resolve_chat(target)
+        if chat_id is None:
+            await _safe_answer(cb, "❌ Контакт не найден")
+            return
+        try:
+            sent_msg = await client.send_message(chat_id, text)
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось отправить сообщение в %s", target)
+            await _safe_answer(cb, "⚠️ Не удалось отправить")
+            return
+        DIRECT_SEND_CTX.pop(message_id, None)
+        _push_dialog(chat_id, "me", text)
+        await _safe_answer(cb, "Отправлено ✅")
+        await _replace_buttons_with_status(
+            cb,
+            f"✅ Отправлено пользователю {esc_md(target_name)}:"
+            f" {esc_md(text[:100])}",
+        )
+        try:
+            await cb.message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(
+                    {"inline_keyboard": [
+                        [{"text": "🗑 Удалить из чата получателя",
+                          "callback_data": f"ddelete|{chat_id}|{sent_msg.id}"}]
+                    ]}
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    if action.startswith("dedit|"):
+        _, target, text = action.split("|", 2)
+        await _safe_answer(cb, "Режим правки — отправьте новое текстовое сообщение")
+        EDIT_CTX[message_id] = EditCtx(
+            peer_id=0, peer_name=target, peer_msg_id=0,
+            original=text, draft=text,
+        )
+        return
+
+    if action.startswith("dcancel|"):
+        await _safe_answer(cb, "Отменено ❌")
+        DIRECT_SEND_CTX.pop(message_id, None)
+        await _replace_buttons_with_status(cb, "❌ Отменено")
+        return
+
+    if action.startswith("ddelete|"):
+        _, chat_id_str, msg_id_str = action.split("|", 2)
+        try:
+            target_chat_id = int(chat_id_str)
+            target_msg_id = int(msg_id_str)
+        except ValueError:
+            await _safe_answer(cb, "Неверные данные")
+            return
+        try:
+            await client.delete_messages(target_chat_id, target_msg_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось удалить сообщение %s в чате %s", target_msg_id, target_chat_id)
+            await _safe_answer(cb, "⚠️ Не удалось удалить")
+            return
+        DIRECT_SEND_CTX.pop(message_id, None)
+        await _safe_answer(cb, "Удалено 🗑")
+        await _replace_buttons_with_status(cb, "🗑 Сообщение удалено")
+        return
+
 
 async def handle_edited(message: Message) -> None:
     """Правка сообщения в служебном чате -> AI-доработка и отправка собеседнику."""
@@ -814,6 +913,78 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
         )
 
 
+    if action.startswith("dsend|"):
+        _, target, text = action.split("|", 2)
+        chat_id2, target_name = await _resolve_chat(target)
+        if chat_id2 is None:
+            await bot_api.answer_callback_query(cb_id, "❌ Контакт не найден")
+            return
+        try:
+            sent_msg = await client.send_message(chat_id2, text)
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось отправить сообщение в %s", target)
+            await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить")
+            return
+        DIRECT_SEND_CTX.pop(message_id, None)
+        _push_dialog(chat_id2, "me", text)
+        await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
+        await bot_edit_with_status(
+            chat_id, message_id, base,
+            f"✅ Отправлено пользователю {esc_html(target_name)}:"
+            f" {esc_html(text[:100])}",
+        )
+        try:
+            await bot_api.edit_message_text(
+                owner_id, message_id,
+                (base + "\n\n" + esc_html(
+                    f"✅ Отправлено пользователю {target_name}:"
+                    f" {text[:100]}"
+                )),
+                parse_mode="HTML",
+                reply_markup={"inline_keyboard": [[
+                    {"text": "🗑 Удалить из чата получателя",
+                     "callback_data": f"ddelete|{chat_id2}|{sent_msg.id}"}
+                ]]},
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    if action.startswith("dedit|"):
+        _, target, text = action.split("|", 2)
+        await bot_api.answer_callback_query(cb_id, "Режим правки — отправьте новое текстовое сообщение")
+        EDIT_CTX[message_id] = EditCtx(
+            peer_id=0, peer_name=target, peer_msg_id=0,
+            original=text, draft=text,
+        )
+        return
+
+    if action.startswith("dcancel|"):
+        await bot_api.answer_callback_query(cb_id, "Отменено ❌")
+        DIRECT_SEND_CTX.pop(message_id, None)
+        await bot_edit_with_status(chat_id, message_id, base, "❌ Отменено")
+        return
+
+    if action.startswith("ddelete|"):
+        _, chat_id_str, msg_id_str = action.split("|", 2)
+        try:
+            target_chat_id = int(chat_id_str)
+            target_msg_id = int(msg_id_str)
+        except ValueError:
+            await bot_api.answer_callback_query(cb_id, "Неверные данные")
+            return
+        try:
+            await client.delete_messages(target_chat_id, target_msg_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось удалить сообщение %s в чате %s", target_msg_id, target_chat_id)
+            await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось удалить")
+            return
+        DIRECT_SEND_CTX.pop(message_id, None)
+        await bot_api.answer_callback_query(cb_id, "Удалено 🗑")
+        await bot_edit_with_status(chat_id, message_id, base, "🗑 Сообщение удалено")
+        return
+
+
 async def _resolve_chat(target: str) -> Optional[tuple[int, str]]:
     """Пытается найти чат/группу по @username, числовому ID или названию.
 
@@ -862,6 +1033,51 @@ async def _handle_direct_send(target: str, text: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось отправить сообщение в чат %s", target)
         return None
+
+
+async def _handle_delete_intent(intent: dict) -> None:
+    """Обрабатывает команду удаления последних сообщений у собеседника."""
+    target = intent.get("target", "")
+    count = intent.get("count", 1)
+    chat_id, target_name = await _resolve_chat(target)
+    if chat_id is None:
+        await bot_api.send_message(
+            owner_id,
+            f"❌ Не нашёл контакт/чат с именем «{esc_html(target)}».",
+        )
+        return
+    try:
+        history = await client.get_chat_history(chat_id, limit=count)
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось получить историю чата %s", chat_id)
+        await bot_api.send_message(
+            owner_id,
+            f"⚠️ Не удалось получить историю чата с {esc_html(target_name)}.",
+        )
+        return
+    messages_to_delete = [m.id for m in history if m.outgoing]
+    if not messages_to_delete:
+        await bot_api.send_message(
+            owner_id,
+            f"ℹ️ Нет входящих сообщений для удаления в чате с {esc_html(target_name)}.",
+        )
+        return
+    try:
+        await client.delete_messages(chat_id, messages_to_delete)
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось удалить сообщения в чате %s", chat_id)
+        await bot_api.send_message(
+            owner_id,
+            f"⚠️ Не удалось удалить сообщения в чате с {esc_html(target_name)}.",
+        )
+        return
+    await bot_api.send_message(
+        owner_id,
+        f"🗑 Удалено {len(messages_to_delete)} последни"
+        f"{'х' if count == 1 else 'х'} сообщени"
+        f"{'е' if count == 1 else 'я' if count < 5 else 'й'} "
+        f"в чате с {esc_html(target_name)}.",
+    )
 
 
 async def bot_handle_message(msg: dict[str, Any]) -> None:
@@ -954,18 +1170,44 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
 
     intent = detect_direct_send_intent(text)
     if intent is not None:
-        name = await _handle_direct_send(intent.target, intent.text)
-        if name:
-            await bot_api.send_message(
-                owner_id,
-                "✅ Сообщение отправлено пользователю "
-                f"{esc_html(intent.target)}:{esc_html(intent.text[:100])}",
-            )
-        else:
+        chat_id, target_name = await _resolve_chat(intent.target)
+        if chat_id is None:
             await bot_api.send_message(
                 owner_id,
                 f"❌ Не нашёл контакт/чат с именем «{esc_html(intent.target)}».",
             )
+            return
+        # Show preview with buttons instead of sending immediately
+        buttons = [
+            [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{intent.target}|{intent.text[:80]}"}],
+            [{"text": "✏️ Редактировать", "callback_data": f"dedit|{intent.target}|{intent.text[:80]}"}],
+            [{"text": "❌ Отмена", "callback_data": f"dcancel|{intent.target}|{intent.text[:80]}"}],
+        ]
+        body = (
+            "📝 Предпросмотр сообщения для <b>"
+            f"{esc_html(target_name)}</b>:\n\n"
+            f"{esc_html(intent.text[:500])}"
+        )
+        try:
+            sent = await bot_api.send_message(
+                owner_id, body, parse_mode="HTML",
+                reply_markup={"inline_keyboard": buttons},
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось отправить предпросмотр")
+            return
+        DIRECT_SEND_CTX[sent["message_id"]] = {
+            "target": intent.target,
+            "text": intent.text,
+            "target_name": target_name,
+            "chat_id": chat_id,
+        }
+        return
+
+    # Delete intent: "удали [N] последнее сообщение у/пользователю <ИМЯ>"
+    del_intent = detect_delete_intent(text)
+    if del_intent is not None:
+        await _handle_delete_intent(del_intent)
         return
 
     if not text or not bot_msg_id:
@@ -1055,6 +1297,8 @@ shared.PENDING = PENDING
 shared.EDIT_CTX = EDIT_CTX
 shared.IN_FLIGHT = IN_FLIGHT
 shared.GEN_CTX = GEN_CTX
+shared.DIRECT_SEND_CTX = DIRECT_SEND_CTX
+shared.SENT_MSG_CTX = SENT_MSG_CTX
 shared._normalize_ref = _normalize_ref
 shared._is_auto_peer = _is_auto_peer
 shared._peer_ref = _peer_ref

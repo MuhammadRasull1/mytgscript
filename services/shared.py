@@ -38,6 +38,8 @@ class Shared:
     EDIT_CTX: dict = {}
     IN_FLIGHT: set = set()
     GEN_CTX: dict = {}
+    DIRECT_SEND_CTX: dict = {}
+    SENT_MSG_CTX: dict = {}
 
 
 shared = Shared()

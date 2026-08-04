@@ -653,6 +653,86 @@ async def handle_callback(cb: CallbackQuery) -> None:
     await _safe_answer(cb, "")
     if not cb.data:
         return
+
+    # 1. Кнопки прямого черновика (dsend/dcancel/dedit/ddelete) — их data
+    #    НЕ 4-частная, поэтому разбираем до общего парсинга.
+    if cb.data.startswith(("dsend|", "dcancel|", "dedit|", "ddelete|")):
+        parts = cb.data.split("|")
+        action = parts[0]
+        preview_msg_id = cb.message.id if cb.message else None
+
+        draft = ACTIVE_DRAFT.get("current") or ACTIVE_DRAFT.get(owner_id)
+
+        if action == "dsend":
+            if draft is None:
+                await _safe_answer(cb, "Черновик устарел")
+                return
+            try:
+                await client.send_message(draft["chat_id"], draft["text"])
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Не удалось отправить черновик пользователю chat_id=%s",
+                    draft.get("chat_id"),
+                )
+                await _safe_answer(cb, "⚠️ Не удалось отправить")
+                return
+            _push_dialog(draft["chat_id"], "me", draft["text"])
+            DIRECT_SEND_CTX.pop(preview_msg_id, None)
+            ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
+            await _safe_answer(cb, "Отправлено ✅")
+            await _replace_buttons_with_status(
+                cb, f"✅ Отправлено пользователю {esc_md(draft['target'])}"
+            )
+            return
+
+        if action == "dcancel":
+            DIRECT_SEND_CTX.pop(preview_msg_id, None)
+            ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
+            await _safe_answer(cb, "Отменено ❌")
+            await _replace_buttons_with_status(cb, "❌ Отменено")
+            return
+
+        if action == "dedit":
+            await _safe_answer(cb, "✏️ Режим правки")
+            if draft is None:
+                await cb.message.reply(
+                    "⏳ Черновик устарел (возможно, перезапуск). Создайте новый."
+                )
+                return
+            sent = await client.send_message(
+                service_chat_id,
+                "✍️ Напиши в чат, что изменить "
+                "(например: «сделай вежливее» или «добавь про встречу»)\n\nЧерновик:\n"
+                + draft["text"],
+            )
+            EDIT_CTX[sent.id] = EditCtx(
+                peer_id=0, peer_name=draft["target"], peer_msg_id=0,
+                original=draft["text"], draft=draft["text"],
+            )
+            return
+
+        if action == "ddelete":
+            try:
+                target_chat_id = int(parts[1])
+                target_msg_id = int(parts[2])
+            except (ValueError, IndexError):
+                await _safe_answer(cb, "Неверные данные")
+                return
+            try:
+                await client.delete_messages(target_chat_id, target_msg_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Не удалось удалить сообщение %s в чате %s",
+                    target_msg_id, target_chat_id,
+                )
+                await _safe_answer(cb, "⚠️ Не удалось удалить")
+                return
+            DIRECT_SEND_CTX.pop(preview_msg_id, None)
+            await _safe_answer(cb, "Удалено 🗑")
+            await _replace_buttons_with_status(cb, "🗑 Сообщение удалено")
+            return
+
+    # 2. Только ЕСЛИ это обычные варианты ответа автоответчика (4 части):
     try:
         action, peer_id_str, msg_id_str, idx_str = cb.data.split("|", 3)
         peer_id, msg_id, idx = int(peer_id_str), int(msg_id_str), int(idx_str)
@@ -710,82 +790,6 @@ async def handle_callback(cb: CallbackQuery) -> None:
         await _replace_buttons_with_status(
             cb, f"✅ Отправлено для {peer_name}: \"{variant}\""
         )
-
-    if action.startswith("dsend|"):
-        _, target, text = action.split("|", 2)
-        chat_id, target_name = await _resolve_chat(target)
-        if chat_id is None:
-            await _safe_answer(cb, "❌ Контакт не найден")
-            return
-        await _safe_answer(cb, "Генерация текста…")
-        generated = await generate_direct_send_text(text)
-        send_text = generated or text
-        try:
-            sent_msg = await client.send_message(chat_id, send_text)
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось отправить сообщение в %s", target)
-            await _safe_answer(cb, "⚠️ Не удалось отправить")
-            return
-        DIRECT_SEND_CTX.pop(message_id, None)
-        ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
-        _push_dialog(chat_id, "me", send_text)
-        await _safe_answer(cb, "Отправлено ✅")
-        await _replace_buttons_with_status(
-            cb,
-            f"✅ Отправлено пользователю {esc_md(target_name)}:"
-            f" {esc_md(send_text[:100])}",
-        )
-        try:
-            await cb.message.edit_reply_markup(
-                reply_markup=InlineKeyboardMarkup(
-                    {"inline_keyboard": [
-                        [{"text": "🗑 Удалить из чата получателя",
-                          "callback_data": f"ddelete|{chat_id}|{sent_msg.id}"}]
-                    ]}
-                ),
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    if action.startswith("dedit|"):
-        _, target, text = action.split("|", 2)
-        await _safe_answer(cb, "✏️ Режим правки")
-        EDIT_CTX[message_id] = EditCtx(
-            peer_id=0, peer_name=target, peer_msg_id=0,
-            original=text, draft=text,
-        )
-        await cb.message.reply(
-            "✍️ Напиши в чат, что изменить "
-            "(например: «сделай вежливее» или «добавь про встречу»)"
-        )
-        return
-
-    if action.startswith("dcancel|"):
-        await _safe_answer(cb, "Отменено ❌")
-        DIRECT_SEND_CTX.pop(message_id, None)
-        ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
-        await _replace_buttons_with_status(cb, "❌ Отменено")
-        return
-
-    if action.startswith("ddelete|"):
-        _, chat_id_str, msg_id_str = action.split("|", 2)
-        try:
-            target_chat_id = int(chat_id_str)
-            target_msg_id = int(msg_id_str)
-        except ValueError:
-            await _safe_answer(cb, "Неверные данные")
-            return
-        try:
-            await client.delete_messages(target_chat_id, target_msg_id)
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось удалить сообщение %s в чате %s", target_msg_id, target_chat_id)
-            await _safe_answer(cb, "⚠️ Не удалось удалить")
-            return
-        DIRECT_SEND_CTX.pop(message_id, None)
-        await _safe_answer(cb, "Удалено 🗑")
-        await _replace_buttons_with_status(cb, "🗑 Сообщение удалено")
-        return
 
 
 async def handle_edited(message: Message) -> None:
@@ -869,17 +873,99 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
     if user_id != owner_id:
         return
     data = cb.get("data") or ""
+
+    message = cb.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    base = message.get("text") or ""
+
+    # 1. Кнопки прямого черновика (dsend/dcancel/dedit/ddelete) — их data
+    #    НЕ 4-частная, поэтому разбираем до общего парсинга.
+    if data.startswith(("dsend|", "dcancel|", "dedit|", "ddelete|")):
+        parts = data.split("|")
+        action = parts[0]
+
+        draft = ACTIVE_DRAFT.get("current") or ACTIVE_DRAFT.get(owner_id)
+
+        if action == "dsend":
+            if draft is None:
+                await bot_api.answer_callback_query(cb_id, "Черновик устарел")
+                return
+            try:
+                await client.send_message(draft["chat_id"], draft["text"])
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Не удалось отправить черновик пользователю chat_id=%s",
+                    draft.get("chat_id"),
+                )
+                await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить")
+                return
+            _push_dialog(draft["chat_id"], "me", draft["text"])
+            DIRECT_SEND_CTX.pop(message_id, None)
+            ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
+            await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
+            await bot_edit_with_status(
+                chat_id, message_id, base,
+                f"✅ Отправлено пользователю {esc_html(draft['target'])}",
+            )
+            return
+
+        if action == "dcancel":
+            DIRECT_SEND_CTX.pop(message_id, None)
+            ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
+            await bot_api.answer_callback_query(cb_id, "Отменено ❌")
+            await bot_edit_with_status(chat_id, message_id, base, "❌ Отменено")
+            return
+
+        if action == "dedit":
+            await bot_api.answer_callback_query(cb_id, "✏️ Режим правки")
+            if draft is None:
+                await bot_api.send_message(
+                    owner_id,
+                    "⏳ Черновик устарел (возможно, перезапуск). Создайте новый.",
+                )
+                return
+            sent = await bot_api.send_message(
+                owner_id,
+                "✍️ Напиши в чат, что изменить "
+                "(например: «сделай вежливее» или «добавь про встречу»)\n\nЧерновик:\n"
+                + esc_html(draft["text"]),
+                parse_mode="HTML",
+            )
+            EDIT_CTX[sent["message_id"]] = EditCtx(
+                peer_id=0, peer_name=draft["target"], peer_msg_id=0,
+                original=draft["text"], draft=draft["text"],
+            )
+            return
+
+        if action == "ddelete":
+            try:
+                target_chat_id = int(parts[1])
+                target_msg_id = int(parts[2])
+            except (ValueError, IndexError):
+                await bot_api.answer_callback_query(cb_id, "Неверные данные")
+                return
+            try:
+                await client.delete_messages(target_chat_id, target_msg_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Не удалось удалить сообщение %s в чате %s",
+                    target_msg_id, target_chat_id,
+                )
+                await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось удалить")
+                return
+            DIRECT_SEND_CTX.pop(message_id, None)
+            await bot_api.answer_callback_query(cb_id, "Удалено 🗑")
+            await bot_edit_with_status(chat_id, message_id, base, "🗑 Сообщение удалено")
+            return
+
+    # 2. Только ЕСЛИ это обычные варианты ответа автоответчика (4 части):
     try:
         action, peer_id_str, msg_id_str, idx_str = data.split("|", 3)
         peer_id, msg_id, idx = int(peer_id_str), int(msg_id_str), int(idx_str)
     except (ValueError, AttributeError):
         await bot_api.answer_callback_query(cb_id, "Неизвестная кнопка")
         return
-
-    message = cb.get("message") or {}
-    chat_id = (message.get("chat") or {}).get("id")
-    message_id = message.get("message_id")
-    base = message.get("text") or ""
 
     # Кнопки доработанного черновика (rsend/redit/rcancel) и генератора /con
     if action in ("rsend", "redit", "rcancel", "gensel", "gencancel"):
@@ -986,88 +1072,6 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
         await bot_edit_with_status(
             chat_id, message_id, base, f"✅ Отправлено для {peer_name}: \"{variant}\""
         )
-
-
-    if action.startswith("dsend|"):
-        _, target, text = action.split("|", 2)
-        chat_id2, target_name = await _resolve_chat(target)
-        if chat_id2 is None:
-            await bot_api.answer_callback_query(cb_id, "❌ Контакт не найден")
-            return
-        await bot_api.answer_callback_query(cb_id, "Генерация текста…")
-        generated = await generate_direct_send_text(text)
-        send_text = generated or text
-        try:
-            sent_msg = await client.send_message(chat_id2, send_text)
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось отправить сообщение в %s", target)
-            await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить")
-            return
-        DIRECT_SEND_CTX.pop(message_id, None)
-        ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
-        _push_dialog(chat_id2, "me", send_text)
-        await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
-        await bot_edit_with_status(
-            chat_id, message_id, base,
-            f"✅ Отправлено пользователю {esc_html(target_name)}:"
-            f" {esc_html(send_text[:100])}",
-        )
-        try:
-            await bot_api.edit_message_text(
-                owner_id, message_id,
-                (base + "\n\n" + esc_html(
-                    f"✅ Отправлено пользователю {target_name}:"
-                    f" {send_text[:100]}"
-                )),
-                parse_mode="HTML",
-                reply_markup={"inline_keyboard": [[
-                    {"text": "🗑 Удалить из чата получателя",
-                     "callback_data": f"ddelete|{chat_id2}|{sent_msg.id}"}
-                ]]},
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    if action.startswith("dedit|"):
-        _, target, text = action.split("|", 2)
-        await bot_api.answer_callback_query(cb_id, "✏️ Режим правки")
-        EDIT_CTX[message_id] = EditCtx(
-            peer_id=0, peer_name=target, peer_msg_id=0,
-            original=text, draft=text,
-        )
-        await bot_api.send_message(
-            owner_id,
-            "✍️ Напиши в чат, что изменить "
-            "(например: «сделай вежливее» или «добавь про встречу»)",
-        )
-        return
-
-    if action.startswith("dcancel|"):
-        await bot_api.answer_callback_query(cb_id, "Отменено ❌")
-        DIRECT_SEND_CTX.pop(message_id, None)
-        ACTIVE_DRAFT.pop("current", None); ACTIVE_DRAFT.pop(owner_id, None)
-        await bot_edit_with_status(chat_id, message_id, base, "❌ Отменено")
-        return
-
-    if action.startswith("ddelete|"):
-        _, chat_id_str, msg_id_str = action.split("|", 2)
-        try:
-            target_chat_id = int(chat_id_str)
-            target_msg_id = int(msg_id_str)
-        except ValueError:
-            await bot_api.answer_callback_query(cb_id, "Неверные данные")
-            return
-        try:
-            await client.delete_messages(target_chat_id, target_msg_id)
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось удалить сообщение %s в чате %s", target_msg_id, target_chat_id)
-            await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось удалить")
-            return
-        DIRECT_SEND_CTX.pop(message_id, None)
-        await bot_api.answer_callback_query(cb_id, "Удалено 🗑")
-        await bot_edit_with_status(chat_id, message_id, base, "🗑 Сообщение удалено")
-        return
 
 
 async def _resolve_chat(target: str) -> Optional[tuple[int, str]]:

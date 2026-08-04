@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import base64
 import os
 import re
 import time
@@ -318,7 +319,26 @@ def _freeze_gemini_key(api_key: str) -> None:
     _GEMINI_KEY_FAILURES[api_key] = time.monotonic() + GEMINI_QUOTA_FREEZE_SEC
 
 
-async def _gemini_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
+def _read_media(
+    media_path: Optional[str], media_mime: Optional[str]
+) -> Optional[tuple[bytes, str]]:
+    """Читает временный файл медиа в (bytes, mime_type) для Gemini."""
+    if not media_path:
+        return None
+    try:
+        with open(media_path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        shared.logger.warning("Не удалось прочитать медиа: %s", media_path)
+        return None
+    return data, (media_mime or "application/octet-stream")
+
+
+async def _gemini_generate(
+    system_prompt: str,
+    user_prompt: str,
+    media: Optional[tuple[bytes, str]] = None,
+) -> Optional[str]:
     """Вызов Gemini с ротацией ключей.
 
     При HTTP 429 (квота) ключ МГНОВЕННО замораживается на 10 минут, а запрос
@@ -326,6 +346,7 @@ async def _gemini_generate(system_prompt: str, user_prompt: str) -> Optional[str
     ключи пропускаются молча — повторные ошибки квоты не спамят в логи.
     Если все ключи заморожены/недоступны — возвращает None, дальше сработает
     фоллбек на Groq.
+    media — кортеж (bytes, mime_type) для inline_data (фото/голосовое).
     """
     keys = _gemini_api_keys()
     if not keys:
@@ -337,8 +358,19 @@ async def _gemini_generate(system_prompt: str, user_prompt: str) -> Optional[str
         if _is_gemini_key_frozen(api_key):
             continue
         tried = True
+        parts: list[dict[str, Any]] = [{"text": user_prompt}]
+        if media:
+            data, mime = media
+            parts.append(
+                {
+                    "inline_data": {
+                        "mime_type": mime,
+                        "data": base64.b64encode(data).decode("ascii"),
+                    }
+                }
+            )
         body = {
-            "contents": [{"parts": [{"text": user_prompt}]}],
+            "contents": [{"parts": parts}],
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "safetySettings": GEMINI_SAFETY,
             "generationConfig": {"temperature": 0.7, "maxOutputTokens": 500},
@@ -412,16 +444,30 @@ async def _groq_generate(system_prompt: str, user_prompt: str) -> Optional[str]:
         return None
 
 
-async def _generate_with_fallback(system_prompt: str, user_prompt: str) -> Optional[str]:
-    """Gemini (с ротацией ключей), при лимитах/ошибках — автоматический фоллбек на Groq."""
+async def _generate_with_fallback(
+    system_prompt: str,
+    user_prompt: str,
+    media: Optional[tuple[bytes, str]] = None,
+) -> Optional[str]:
+    """Gemini (с ротацией ключей), при лимитах/ошибках — автоматический фоллбек на Groq.
+
+    media — кортеж (bytes, mime_type): Gemini его видит; Groq (текстовая модель)
+    медиа не видит, поэтому в промпт добавляется пометка о наличии вложения.
+    """
     global _last_gemini_down_log
-    raw = await _gemini_generate(system_prompt, user_prompt)
+    raw = await _gemini_generate(system_prompt, user_prompt, media)
     if raw is None:
         now = time.monotonic()
         if now - _last_gemini_down_log >= _GEMINI_DOWN_LOG_INTERVAL:
             _last_gemini_down_log = now
             shared.logger.info("Gemini недоступен/лимит — автоматический фоллбек на Groq")
-        raw = await _groq_generate(system_prompt, user_prompt)
+        groq_prompt = user_prompt
+        if media:
+            groq_prompt += (
+                "\n\n[К сообщению прикреплено медиа (изображение/аудио), "
+                "которое модель не видит. Дай общий ответ по тексту.]"
+            )
+        raw = await _groq_generate(system_prompt, groq_prompt)
     return raw
 
 
@@ -432,6 +478,8 @@ async def generate_suggestions(
     web_context: str = "",
     history: str = "",
     username: str = "",
+    media_path: Optional[str] = None,
+    media_mime: Optional[str] = None,
 ) -> list[str]:
     """Генерирует варианты ответа напрямую: Gemini, при лимитах — Groq.
 
@@ -440,10 +488,20 @@ async def generate_suggestions(
     web_context — свежие результаты поиска, если /inter включён для собеседника.
     history — последние сообщения диалога (контекст для коротких реплик).
     username — @username собеседника (пассивное знание, без спама обращением).
+    media_path/media_mime — путь к временному файлу вложения (фото/ГС) и его
+    MIME; Gemini видит содержимое, Groq — нет (только пометку).
     """
+    media = _read_media(media_path, media_mime)
+    user_prompt = _build_user_prompt(text, peer_name, web_context, history, username)
+    if media:
+        user_prompt += (
+            "\n\nСобеседник также прислал вложение (изображение/аудио) — "
+            "учитывай его содержимое."
+        )
     raw = await _generate_with_fallback(
         AI_SYSTEM_PROMPT + role_suffix,
-        _build_user_prompt(text, peer_name, web_context, history, username),
+        user_prompt,
+        media,
     )
     suggestions = _parse_suggestions(raw) if raw else []
     shared.logger.info("Сгенерировано вариантов ответа: %s", len(suggestions))
@@ -492,16 +550,30 @@ _DIRECT_SEND_SYSTEM_PROMPT = (
 )
 
 
-async def generate_direct_send_text(topic: str) -> Optional[str]:
+async def generate_direct_send_text(
+    topic: str,
+    media_path: Optional[str] = None,
+    media_mime: Optional[str] = None,
+) -> Optional[str]:
     """Генерирует естественное сообщение для Telegram на основе темы.
 
     Используется при прямой отправке: пользователь указывает тему
     (например, "привет" или "как дела"), а ИИ формулирует
     готовое сообщение для отправки собеседнику.
+    media_path/media_mime — путь к временному файлу вложения (фото/ГС) и его
+    MIME; Gemini видит содержимое и опирается на него.
     """
+    media = _read_media(media_path, media_mime)
+    user_prompt = f"Тема: {topic}"
+    if media:
+        user_prompt += (
+            "\n\nК запросу прикреплено вложение (изображение/аудио) — "
+            "опирайся на его содержимое."
+        )
     raw = await _generate_with_fallback(
         _DIRECT_SEND_SYSTEM_PROMPT,
-        f"Тема: {topic}",
+        user_prompt,
+        media,
     )
     if raw:
         shared.logger.info("Сгенерировано сообщение для прямой отправки: %s", raw[:80])

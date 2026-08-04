@@ -109,6 +109,25 @@ class BotApiClient:
             params["text"] = text
         return await self.call("answerCallbackQuery", **params)
 
+    async def get_file(self, file_id: str) -> dict:
+        """Возвращает file_path для file_id (для скачивания медиа)."""
+        return await self.call("getFile", file_id=file_id)
+
+    async def download_file(self, file_path: str, dest: str) -> None:
+        """Скачивает файл по пути из getFile в локальный файл dest."""
+        url = f"https://api.telegram.org/file/bot{self._token}/{file_path}"
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=60)
+            ) as resp:
+                if resp.status >= 400:
+                    raise BotApiError(f"file download: HTTP {resp.status}")
+                with open(dest, "wb") as fh:
+                    async for chunk in resp.content.iter_chunked(65536):
+                        fh.write(chunk)
+        except aiohttp.ClientError as exc:
+            raise BotApiError(f"file download: сеть недоступна ({exc})") from exc
+
     async def get_updates(self, offset: Optional[int] = None, timeout: int = 25) -> list:
         params: dict[str, Any] = {"timeout": timeout}
         if offset is not None:

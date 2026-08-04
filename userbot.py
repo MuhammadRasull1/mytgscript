@@ -44,6 +44,7 @@ import contextlib
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
@@ -277,6 +278,88 @@ _load_auto_users()
 # Обработка входящих ЛС
 # ---------------------------------------------------------------------------
 
+# Папка для временных файлов медиа (фото/ГС), отправляемых в Gemini
+MEDIA_TMP_DIR = os.path.join("data", "tmp")
+
+
+def _cleanup_temp_file(path: Optional[str]) -> None:
+    """Удаляет временный файл медиа (безопасно, при любом исходе)."""
+    if path:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+def _media_extension(mime: Optional[str]) -> str:
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "audio/ogg": ".ogg",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "video/mp4": ".mp4",
+    }.get(mime or "", ".bin")
+
+
+async def _download_pyrogram_media(
+    message: Message,
+) -> tuple[Optional[str], Optional[str]]:
+    """Скачивает фото/ГС/аудио из Pyrogram-сообщения в data/tmp.
+
+    Возвращает (путь, mime_type) или (None, None), если медиа нет.
+    """
+    mime: Optional[str] = None
+    if message.photo:
+        mime = "image/jpeg"
+    elif message.voice:
+        mime = getattr(message.voice, "mime_type", None) or "audio/ogg"
+    elif message.audio:
+        mime = getattr(message.audio, "mime_type", None) or "audio/mpeg"
+    else:
+        return None, None
+    os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
+    name = f"dl_{uuid.uuid4().hex}{_media_extension(mime)}"
+    path = await message.download(file_name=os.path.join(MEDIA_TMP_DIR, name))
+    if not path:
+        return None, None
+    return str(path), mime
+
+
+async def _download_bot_api_media(msg: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Скачивает фото/ГС/аудио из сообщения Bot API в data/tmp.
+
+    Возвращает (путь, mime_type) или (None, None), если медиа нет или скачивание
+    не удалось (в этом случае файл чистится сразу).
+    """
+    file_id: Optional[str] = None
+    mime: Optional[str] = None
+    if msg.get("photo"):
+        file_id = msg["photo"][-1]["file_id"]
+        mime = "image/jpeg"
+    elif msg.get("voice"):
+        file_id = msg["voice"]["file_id"]
+        mime = msg["voice"].get("mime_type") or "audio/ogg"
+    elif msg.get("audio"):
+        file_id = msg["audio"]["file_id"]
+        mime = msg["audio"].get("mime_type") or "audio/mpeg"
+    else:
+        return None, None
+    if not file_id:
+        return None, None
+    os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
+    name = f"dl_{uuid.uuid4().hex}{_media_extension(mime)}"
+    path = os.path.join(MEDIA_TMP_DIR, name)
+    try:
+        file_info = await bot_api.get_file(file_id)
+        file_path = (file_info or {}).get("file_path")
+        if not file_path:
+            raise BotApiError("getFile не вернул file_path")
+        await bot_api.download_file(file_path, path)
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось скачать медиа из Bot API")
+        _cleanup_temp_file(path)
+        return None, None
+    return path, mime
+
 
 async def handle_incoming(message: Message) -> None:
     logger.info(
@@ -335,49 +418,55 @@ async def handle_incoming(message: Message) -> None:
 
     intent = detect_direct_send_intent(raw_text)
     if intent is not None and message.chat.id == service_chat_id:
-        chat_id, target_name = await _resolve_chat(intent.target)
-        if chat_id is None:
-            await message.reply(
-                f"❌ Не нашёл контакт/чат с именем «{esc_html(intent.target)}»."
-            )
-            return
-        # СНАЧАЛА генерируем текст ИИ и только ПОСЛЕ этого показываем
-        # карточку предпросмотра с уже сгенерированным текстом
-        generated_text = await generate_direct_send_text(intent.text)
-        send_text = generated_text or intent.text
-        buttons = [
-            [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{intent.target}|{send_text[:80]}"}],
-            [{"text": "✏️ Редактировать", "callback_data": f"dedit|{intent.target}|{send_text[:80]}"}],
-            [{"text": "❌ Отмена", "callback_data": f"dcancel|{intent.target}|{send_text[:80]}"}],
-        ]
-        body = (
-            "📝 Предпросмотр сообщения для <b>"
-            f"{esc_html(target_name)}</b>:\n\n"
-            f"{esc_html(send_text[:500])}"
-        )
+        media_path, media_mime = await _download_pyrogram_media(message)
         try:
-            sent = await client.send_message(
-                service_chat_id, body, parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
-                    {"inline_keyboard": buttons}
-                ),
+            chat_id, target_name = await _resolve_chat(intent.target)
+            if chat_id is None:
+                await message.reply(
+                    f"❌ Не нашёл контакт/чат с именем «{esc_html(intent.target)}»."
+                )
+                return
+            # СНАЧАЛА генерируем текст ИИ и только ПОСЛЕ этого показываем
+            # карточку предпросмотра с уже сгенерированным текстом
+            generated_text = await generate_direct_send_text(
+                intent.text, media_path=media_path, media_mime=media_mime
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось отправить предпросмотр")
-            return
-        preview_msg_id = sent.id
-        DIRECT_SEND_CTX[preview_msg_id] = {
-            "target": intent.target,
-            "text": send_text,
-            "target_name": target_name,
-            "chat_id": chat_id,
-        }
-        ACTIVE_DRAFT["current"] = {
-            "target": intent.target,
-            "text": send_text,
-            "msg_id": preview_msg_id,
-            "chat_id": chat_id,
-        }
+            send_text = generated_text or intent.text
+            buttons = [
+                [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{intent.target}|{send_text[:80]}"}],
+                [{"text": "✏️ Редактировать", "callback_data": f"dedit|{intent.target}|{send_text[:80]}"}],
+                [{"text": "❌ Отмена", "callback_data": f"dcancel|{intent.target}|{send_text[:80]}"}],
+            ]
+            body = (
+                "📝 Предпросмотр сообщения для <b>"
+                f"{esc_html(target_name)}</b>:\n\n"
+                f"{esc_html(send_text[:500])}"
+            )
+            try:
+                sent = await client.send_message(
+                    service_chat_id, body, parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(
+                        {"inline_keyboard": buttons}
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось отправить предпросмотр")
+                return
+            preview_msg_id = sent.id
+            DIRECT_SEND_CTX[preview_msg_id] = {
+                "target": intent.target,
+                "text": send_text,
+                "target_name": target_name,
+                "chat_id": chat_id,
+            }
+            ACTIVE_DRAFT["current"] = {
+                "target": intent.target,
+                "text": send_text,
+                "msg_id": preview_msg_id,
+                "chat_id": chat_id,
+            }
+        finally:
+            _cleanup_temp_file(media_path)
         return
     if message.chat.id == service_chat_id:
         return  # не обрабатываем собственный служебный чат
@@ -392,6 +481,8 @@ async def handle_incoming(message: Message) -> None:
     peer = message.from_user or message.sender_chat
     if peer is None:
         return
+
+    media_path, media_mime = await _download_pyrogram_media(message)
 
     payload: dict[str, Any] = {
         "event": "incoming_message",
@@ -408,6 +499,8 @@ async def handle_incoming(message: Message) -> None:
         "timestamp": int((message.date or datetime.now()).timestamp()),
         "is_forwarded": bool(message.forward_from or message.forward_sender_name),
         "media_type": describe_media(message),
+        "media_path": media_path,
+        "media_mime": media_mime,
     }
     # Роль собеседника (папа/мама/кастомная) + правило интернет-поиска
     role_suffix = _role_prompt_suffix(peer) + _internet_prompt_suffix(peer)
@@ -419,46 +512,52 @@ async def handle_incoming(message: Message) -> None:
     payload["web_context"] = web_context
     payload["history"] = history
     logger.info(
-        "Получено ЛС от %s (%s): %s",
+        "Получено ЛС от %s (%s): %s%s",
         payload["peer_id"],
         payload["peer_name"],
         payload["text"][:80] or "(без текста)",
+        f" + медиа ({media_mime})" if media_path else "",
     )
 
-    # Автопилот: для контактов из списка ответ уходит сразу, без кнопок
-    if _is_auto_peer(peer):
-        await handle_auto_reply(payload)
-        return
+    try:
+        # Автопилот: для контактов из списка ответ уходит сразу, без кнопок
+        if _is_auto_peer(peer):
+            await handle_auto_reply(payload)
+            return
 
-    suggestions = await generate_suggestions(
-        payload["text"],
-        payload["peer_name"],
-        role_suffix,
-        web_context,
-        history,
-        payload["peer_username"],
-    )
-
-    if not suggestions:
-        await notify_owner(
-            f"⚠️ Не удалось получить варианты ответа для {payload['peer_name']}.\n"
-            "Проверьте GEMINI_API_KEY / GROQ_API_KEY в .env."
+        suggestions = await generate_suggestions(
+            payload["text"],
+            payload["peer_name"],
+            role_suffix,
+            web_context,
+            history,
+            payload["peer_username"],
+            media_path=media_path,
+            media_mime=media_mime,
         )
-        return
 
-    # Сохраняем варианты — по ним inline-кнопки командуют отправку
-    PENDING[(payload["peer_id"], payload["message_id"])] = {
-        "suggestions": suggestions,
-        "peer_name": payload["peer_name"],
-        "original": payload["text"],
-    }
+        if not suggestions:
+            await notify_owner(
+                f"⚠️ Не удалось получить варианты ответа для {payload['peer_name']}.\n"
+                "Проверьте GEMINI_API_KEY / GROQ_API_KEY в .env."
+            )
+            return
 
-    if CFG.ai_mode == "userbot":
-        await show_native_buttons(payload, suggestions)
-    elif CFG.ai_mode == "bot_chat":
-        await show_bot_chat_buttons(payload, suggestions)
-    else:
-        logger.info("Варианты получены (режим bot): %s", suggestions)
+        # Сохраняем варианты — по ним inline-кнопки командуют отправку
+        PENDING[(payload["peer_id"], payload["message_id"])] = {
+            "suggestions": suggestions,
+            "peer_name": payload["peer_name"],
+            "original": payload["text"],
+        }
+
+        if CFG.ai_mode == "userbot":
+            await show_native_buttons(payload, suggestions)
+        elif CFG.ai_mode == "bot_chat":
+            await show_bot_chat_buttons(payload, suggestions)
+        else:
+            logger.info("Варианты получены (режим bot): %s", suggestions)
+    finally:
+        _cleanup_temp_file(media_path)
 
 
 def _peer_ref(payload: dict[str, Any]) -> str:
@@ -478,6 +577,8 @@ async def handle_auto_reply(payload: dict[str, Any]) -> None:
         payload.get("web_context") or "",
         payload.get("history") or "",
         payload.get("peer_username") or "",
+        media_path=payload.get("media_path"),
+        media_mime=payload.get("media_mime"),
     )
     if not variants:
         await notify_owner(
@@ -1173,7 +1274,7 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
     """Сообщения владельца в чате с ботом: команды, контакт/правка для /con, правка черновика."""
     if (msg.get("from") or {}).get("id") != owner_id:
         return  # бот игнорирует посторонних
-    text = (msg.get("text") or "").strip()
+    text = (msg.get("text") or msg.get("caption") or "").strip()
     reply_to = msg.get("reply_to_message") or {}
     bot_msg_id = reply_to.get("message_id")
 
@@ -1296,48 +1397,54 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
 
     intent = detect_direct_send_intent(text)
     if intent is not None:
-        chat_id, target_name = await _resolve_chat(intent.target)
-        if chat_id is None:
-            await bot_api.send_message(
-                owner_id,
-                f"❌ Не нашёл контакт/чат с именем «{esc_html(intent.target)}».",
-            )
-            return
-        # СНАЧАЛА генерируем текст ИИ и только ПОСЛЕ этого показываем
-        # карточку предпросмотра с уже сгенерированным текстом
-        generated_text = await generate_direct_send_text(intent.text)
-        send_text = generated_text or intent.text
-        buttons = [
-            [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{intent.target}|{send_text[:80]}"}],
-            [{"text": "✏️ Редактировать", "callback_data": f"dedit|{intent.target}|{send_text[:80]}"}],
-            [{"text": "❌ Отмена", "callback_data": f"dcancel|{intent.target}|{send_text[:80]}"}],
-        ]
-        body = (
-            "📝 Предпросмотр сообщения для <b>"
-            f"{esc_html(target_name)}</b>:\n\n"
-            f"{esc_html(send_text[:500])}"
-        )
+        media_path, media_mime = await _download_bot_api_media(msg)
         try:
-            sent = await bot_api.send_message(
-                owner_id, body, parse_mode="HTML",
-                reply_markup={"inline_keyboard": buttons},
+            chat_id, target_name = await _resolve_chat(intent.target)
+            if chat_id is None:
+                await bot_api.send_message(
+                    owner_id,
+                    f"❌ Не нашёл контакт/чат с именем «{esc_html(intent.target)}».",
+                )
+                return
+            # СНАЧАЛА генерируем текст ИИ и только ПОСЛЕ этого показываем
+            # карточку предпросмотра с уже сгенерированным текстом
+            generated_text = await generate_direct_send_text(
+                intent.text, media_path=media_path, media_mime=media_mime
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("Не удалось отправить предпросмотр")
-            return
-        preview_msg_id = sent["message_id"]
-        DIRECT_SEND_CTX[preview_msg_id] = {
-            "target": intent.target,
-            "text": send_text,
-            "target_name": target_name,
-            "chat_id": chat_id,
-        }
-        ACTIVE_DRAFT["current"] = {
-            "target": intent.target,
-            "text": send_text,
-            "msg_id": preview_msg_id,
-            "chat_id": chat_id,
-        }
+            send_text = generated_text or intent.text
+            buttons = [
+                [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{intent.target}|{send_text[:80]}"}],
+                [{"text": "✏️ Редактировать", "callback_data": f"dedit|{intent.target}|{send_text[:80]}"}],
+                [{"text": "❌ Отмена", "callback_data": f"dcancel|{intent.target}|{send_text[:80]}"}],
+            ]
+            body = (
+                "📝 Предпросмотр сообщения для <b>"
+                f"{esc_html(target_name)}</b>:\n\n"
+                f"{esc_html(send_text[:500])}"
+            )
+            try:
+                sent = await bot_api.send_message(
+                    owner_id, body, parse_mode="HTML",
+                    reply_markup={"inline_keyboard": buttons},
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось отправить предпросмотр")
+                return
+            preview_msg_id = sent["message_id"]
+            DIRECT_SEND_CTX[preview_msg_id] = {
+                "target": intent.target,
+                "text": send_text,
+                "target_name": target_name,
+                "chat_id": chat_id,
+            }
+            ACTIVE_DRAFT["current"] = {
+                "target": intent.target,
+                "text": send_text,
+                "msg_id": preview_msg_id,
+                "chat_id": chat_id,
+            }
+        finally:
+            _cleanup_temp_file(media_path)
         return
 
     # Delete intent: "удали [N] последнее сообщение у/пользователю <ИМЯ>"

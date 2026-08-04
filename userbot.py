@@ -401,10 +401,15 @@ async def _handle_incoming(message: Message) -> None:
         if draft is not None:
             media_path, media_mime = await _download_media(message)
             try:
-                new_text = await rewrite_draft(
-                    draft["text"], raw_text,
-                    media_path=media_path, media_mime=media_mime,
-                )
+                try:
+                    new_text = await rewrite_draft(
+                        draft["text"], raw_text,
+                        media_path=media_path, media_mime=media_mime,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Ошибка при обработке медиа: %s", exc)
+                    await notify_owner(f"⚠️ Не удалось обработать медиа: {exc}")
+                    return
             finally:
                 _cleanup_temp_file(media_path)
             if new_text:
@@ -453,9 +458,14 @@ async def _handle_incoming(message: Message) -> None:
                 return
             # СНАЧАЛА генерируем текст ИИ и только ПОСЛЕ этого показываем
             # карточку предпросмотра с уже сгенерированным текстом
-            generated_text = await generate_direct_send_text(
-                intent.text, media_path=media_path, media_mime=media_mime
-            )
+            try:
+                generated_text = await generate_direct_send_text(
+                    intent.text, media_path=media_path, media_mime=media_mime
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ошибка при обработке медиа: %s", exc)
+                await notify_owner(f"⚠️ Не удалось обработать медиа: {exc}")
+                return
             send_text = generated_text or intent.text
             buttons = [
                 [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{intent.target}|{send_text[:80]}"}],
@@ -550,16 +560,21 @@ async def _handle_incoming(message: Message) -> None:
             await handle_auto_reply(payload)
             return
 
-        suggestions = await generate_suggestions(
-            payload["text"],
-            payload["peer_name"],
-            role_suffix,
-            web_context,
-            history,
-            payload["peer_username"],
-            media_path=media_path,
-            media_mime=media_mime,
-        )
+        try:
+            suggestions = await generate_suggestions(
+                payload["text"],
+                payload["peer_name"],
+                role_suffix,
+                web_context,
+                history,
+                payload["peer_username"],
+                media_path=media_path,
+                media_mime=media_mime,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка при обработке медиа: %s", exc)
+            await notify_owner(f"⚠️ Не удалось обработать медиа: {exc}")
+            return
 
         if not suggestions:
             await notify_owner(
@@ -1322,10 +1337,15 @@ async def _bot_handle_message(msg: dict[str, Any]) -> None:
         if draft is not None:
             media_path, media_mime = await _download_media(msg)
             try:
-                new_text = await rewrite_draft(
-                    draft["text"], text,
-                    media_path=media_path, media_mime=media_mime,
-                )
+                try:
+                    new_text = await rewrite_draft(
+                        draft["text"], text,
+                        media_path=media_path, media_mime=media_mime,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Ошибка при обработке медиа: %s", exc)
+                    await notify_owner(f"⚠️ Не удалось обработать медиа: {exc}")
+                    return
             finally:
                 _cleanup_temp_file(media_path)
             if not new_text:
@@ -1450,9 +1470,14 @@ async def _bot_handle_message(msg: dict[str, Any]) -> None:
                 return
             # СНАЧАЛА генерируем текст ИИ и только ПОСЛЕ этого показываем
             # карточку предпросмотра с уже сгенерированным текстом
-            generated_text = await generate_direct_send_text(
-                intent.text, media_path=media_path, media_mime=media_mime
-            )
+            try:
+                generated_text = await generate_direct_send_text(
+                    intent.text, media_path=media_path, media_mime=media_mime
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ошибка при обработке медиа: %s", exc)
+                await notify_owner(f"⚠️ Не удалось обработать медиа: {exc}")
+                return
             send_text = generated_text or intent.text
             buttons = [
                 [{"text": "🚀 Отправить в 1 клик", "callback_data": f"dsend|{intent.target}|{send_text[:80]}"}],

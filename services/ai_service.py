@@ -404,8 +404,9 @@ async def _gemini_call_with_media(
 ) -> Optional[str]:
     """Мультимодальный вызов Gemini через google-genai (SDK).
 
-    image -> картинка открывается через PIL.Image.open(media_path) и передаётся
-    в contents вместе с текстом;
+    image -> картинка сжимается до 1024px/JPEG (защита от OOM на Render 512MB),
+    затем открывается через PIL.Image.open(media_path) и передаётся в contents
+    вместе с текстом;
     audio/ogg -> файл загружается через files.upload(file=media_path,
     mime_type) и передаётся в contents. Загруженный файл ОБЯЗАТЕЛЬНО удаляется
     через files.delete в блоке finally.
@@ -419,8 +420,15 @@ async def _gemini_call_with_media(
     try:
         client = _genai_sdk.Client(api_key=api_key)
         uploaded = None
+        media_part = None
         try:
             if media_kind == "image":
+                # Сжимаем фото до 1024px, чтобы не съесть память Render (512MB)
+                with _PILImage.open(media_path) as img:
+                    img.thumbnail((1024, 1024))
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                    img.save(media_path, format="JPEG", quality=80)
                 media_part = _PILImage.open(media_path)
             else:
                 uploaded = await client.aio.files.upload(
@@ -440,6 +448,9 @@ async def _gemini_call_with_media(
             )
             return (response.text or "").strip() or None
         finally:
+            if isinstance(media_part, _PILImage.Image):
+                with contextlib.suppress(Exception):
+                    media_part.close()
             if uploaded is not None:
                 with contextlib.suppress(Exception):
                     await client.aio.files.delete(name=uploaded.name)

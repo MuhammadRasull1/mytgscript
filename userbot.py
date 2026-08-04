@@ -817,6 +817,10 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
 async def _resolve_chat(target: str) -> Optional[tuple[int, str]]:
     """Пытается найти чат/группу по @username, числовому ID или названию.
 
+    Для имён: проходит по открытым диалогам через async iterator,
+    сравнивает target с dialog.chat.first_name, dialog.chat.last_name
+    или dialog.chat.title (без учёта регистра и лишних пробелов).
+
     Возвращает (chat_id, display_name) или None.
     """
     try:
@@ -830,11 +834,15 @@ async def _resolve_chat(target: str) -> Optional[tuple[int, str]]:
         if target.lstrip("-").isdigit():
             chat = await client.get_chat(int(target))
             return chat.id, chat.title or str(chat.id)
-        dialogs = await client.get_dialogs()
-        for d in dialogs:
-            title = getattr(d, "title", None) or ""
-            if title.lower() == target.lower():
-                return d.id, title
+        normalized = target.strip().lower()
+        async for dialog in client.get_dialogs():
+            chat = getattr(dialog, "chat", None)
+            if chat is None:
+                continue
+            for attr in ("first_name", "last_name", "title"):
+                val = getattr(chat, attr, None)
+                if val and val.strip().lower() == normalized:
+                    return chat.id, val.strip()
         return None, ""
     except Exception:  # noqa: BLE001
         return None, ""

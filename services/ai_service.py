@@ -23,6 +23,23 @@ _SEND_DIRECT_RE = re.compile(
     r"^(?:напиши\s+в\s+группу|отправь)\s+(@\S+|\d+)\s+(.+)$",
     re.IGNORECASE,
 )
+_SEND_DIRECT_FLEX_RE = re.compile(
+    r"^(?:напиши\s+в\s+группу|отправь)\s+(.+)$",
+    re.IGNORECASE,
+)
+_FILLER_WORDS = frozenset(
+    {
+        "пользователю",
+        "в чат",
+        "в группу",
+        "юзеру",
+        "пользователь",
+        "чату",
+        "группе",
+        "группу",
+        "чат",
+    }
+)
 
 
 @dataclass
@@ -34,6 +51,14 @@ class Intent:
     text: str
 
 
+def _strip_filler(raw: str) -> str:
+    """Убирает мусорные слова из начала строки."""
+    parts = raw.split()
+    while parts and parts[0].lower().strip(".,!?") in _FILLER_WORDS:
+        parts.pop(0)
+    return " ".join(parts)
+
+
 def detect_direct_send_intent(text: str) -> Optional[Intent]:
     """Определяет намерение «написать напрямую» по тексту сообщения.
 
@@ -42,13 +67,29 @@ def detect_direct_send_intent(text: str) -> Optional[Intent]:
       «Напиши в группу НазваниеГруппы текст»
       «Отправь @username текст»
       «Отправь 123456 текст»
+      «Напиши пользователю Улу привет»
+      «Отправь юзеру Улу привет»
+
+    Мусорные слова ("пользователю", "в чат", "в группу", "юзеру" и
+    подобные) автоматически удаляются из target.
 
     Возвращает Intent(action="send_direct") или None.
     """
     m = _SEND_DIRECT_RE.match(text.strip())
+    if m:
+        return Intent(
+            action="send_direct",
+            target=m.group(1),
+            text=m.group(2).strip(),
+        )
+    m = _SEND_DIRECT_FLEX_RE.match(text.strip())
     if not m:
         return None
-    return Intent(action="send_direct", target=m.group(1), text=m.group(2).strip())
+    cleaned = _strip_filler(m.group(1).strip())
+    parts = cleaned.split(None, 1)
+    if len(parts) < 2:
+        return None
+    return Intent(action="send_direct", target=parts[0], text=parts[1].strip())
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")

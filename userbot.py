@@ -305,7 +305,8 @@ async def _download_pyrogram_media(
 ) -> tuple[Optional[str], Optional[str]]:
     """Скачивает фото/ГС/аудио из Pyrogram-сообщения в data/tmp.
 
-    Возвращает (путь, mime_type) или (None, None), если медиа нет.
+    Возвращает (путь, mime_type) или (None, None), если медиа нет или скачивание
+    не удалось (в этом случае файл чистится сразу и бот НЕ падает).
     """
     mime: Optional[str] = None
     if message.photo:
@@ -316,12 +317,21 @@ async def _download_pyrogram_media(
         mime = getattr(message.audio, "mime_type", None) or "audio/mpeg"
     else:
         return None, None
-    os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
-    name = f"dl_{uuid.uuid4().hex}{_media_extension(mime)}"
-    path = await message.download(file_name=os.path.join(MEDIA_TMP_DIR, name))
-    if not path:
+    path: Optional[str] = None
+    try:
+        os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
+        name = f"dl_{uuid.uuid4().hex}{_media_extension(mime)}"
+        path = os.path.join(MEDIA_TMP_DIR, name)
+        downloaded = await message.download(file_name=path)
+    except Exception:  # noqa: BLE001
+        logger.exception("Получено медиа (%s), скачивание упало — пропускаем", mime)
+        _cleanup_temp_file(path)
         return None, None
-    return str(path), mime
+    if not downloaded:
+        logger.info("Получено медиа (%s), скачивание не удалось — пропускаем", mime)
+        _cleanup_temp_file(path)
+        return None, None
+    return str(downloaded), mime
 
 
 async def _download_bot_api_media(msg: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
@@ -332,18 +342,20 @@ async def _download_bot_api_media(msg: dict[str, Any]) -> tuple[Optional[str], O
     """
     file_id: Optional[str] = None
     mime: Optional[str] = None
-    if msg.get("photo"):
-        file_id = msg["photo"][-1]["file_id"]
+    photos = msg.get("photo") or []
+    if photos:
+        file_id = photos[-1].get("file_id")
         mime = "image/jpeg"
     elif msg.get("voice"):
-        file_id = msg["voice"]["file_id"]
+        file_id = msg["voice"].get("file_id")
         mime = msg["voice"].get("mime_type") or "audio/ogg"
     elif msg.get("audio"):
-        file_id = msg["audio"]["file_id"]
+        file_id = msg["audio"].get("file_id")
         mime = msg["audio"].get("mime_type") or "audio/mpeg"
     else:
         return None, None
     if not file_id:
+        logger.info("Получено медиа (%s), нет file_id — пропускаем", mime)
         return None, None
     os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
     name = f"dl_{uuid.uuid4().hex}{_media_extension(mime)}"
@@ -355,7 +367,7 @@ async def _download_bot_api_media(msg: dict[str, Any]) -> tuple[Optional[str], O
             raise BotApiError("getFile не вернул file_path")
         await bot_api.download_file(file_path, path)
     except Exception:  # noqa: BLE001
-        logger.exception("Не удалось скачать медиа из Bot API")
+        logger.exception("Получено медиа (%s), скачивание из Bot API упало — пропускаем", mime)
         _cleanup_temp_file(path)
         return None, None
     return path, mime

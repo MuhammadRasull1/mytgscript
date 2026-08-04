@@ -585,6 +585,7 @@ async def handle_callback(cb: CallbackQuery) -> None:
     а текст варианта и имя собеседника берутся из PENDING. После действия
     кнопки заменяются статусом «✅ Отправлено для <Имя>: "текст"».
     """
+    await _safe_answer(cb, "")
     if not cb.data:
         return
     try:
@@ -789,9 +790,9 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
     заменяются статусом «✅ Отправлено для <Имя>: "текст"».
     """
     cb_id = cb.get("id")
+    await bot_api.answer_callback_query(cb_id, "")
     user_id = (cb.get("from") or {}).get("id")
     if user_id != owner_id:
-        await bot_api.answer_callback_query(cb_id, "⛔ Кнопки доступны только владельцу")
         return
     data = cb.get("data") or ""
     try:

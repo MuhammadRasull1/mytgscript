@@ -956,11 +956,15 @@ async def bot_handle_message(msg: dict[str, Any]) -> None:
     if intent is not None:
         name = await _handle_direct_send(intent.target, intent.text)
         if name:
-            await bot_api.send_message(owner_id, f"✅ Сообщение отправлено в {esc_html(name)}")
+            await bot_api.send_message(
+                owner_id,
+                "✅ Сообщение отправлено пользователю "
+                f"{esc_html(intent.target)}:{esc_html(intent.text[:100])}",
+            )
         else:
             await bot_api.send_message(
                 owner_id,
-                f"⚠️ Не удалось найти чат/группу «{esc_html(intent.target)}».",
+                f"❌ Не нашёл контакт/чат с именем «{esc_html(intent.target)}».",
             )
         return
 

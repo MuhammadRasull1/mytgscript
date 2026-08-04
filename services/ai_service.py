@@ -24,7 +24,7 @@ _SEND_DIRECT_RE = re.compile(
     re.IGNORECASE,
 )
 _SEND_DIRECT_FLEX_RE = re.compile(
-    r"^(?:напиши\s+в\s+группу|отправь)\s+(.+)$",
+    r"^(?:напиши\s+(?:в\s+группу|пользователю|кому)|отправь\s+(?:пользователю|кому))\s+(.+)$",
     re.IGNORECASE,
 )
 _FILLER_WORDS = frozenset(

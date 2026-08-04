@@ -370,6 +370,16 @@ async def _download_media(source: Any) -> tuple[Optional[str], Optional[str]]:
 
 
 async def handle_incoming(message: Message) -> None:
+    """Глобальный предохранитель: любая ошибка при обработке входящего сообщения
+    (текст, фото, ГС, команды) логируется, но бот не падает и не перезапускается."""
+    try:
+        await _handle_incoming(message)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ошибка при обработке сообщения/медиа: %s", exc)
+        return
+
+
+async def _handle_incoming(message: Message) -> None:
     logger.info(
         f"Детектор: получено сообщение {message.id} от {message.from_user.id if message.from_user else 'unknown'}, me={message.from_user.is_self if message.from_user else False}"
     )
@@ -499,42 +509,42 @@ async def handle_incoming(message: Message) -> None:
 
     media_path, media_mime = await _download_media(message)
 
-    payload: dict[str, Any] = {
-        "event": "incoming_message",
-        "peer_id": peer.id,
-        "peer_name": (
-            getattr(peer, "first_name", None)
-            or getattr(peer, "title", None)
-            or str(peer.id)
-        ),
-        "peer_username": getattr(peer, "username", None),
-        "message_id": message.id,
-        "text": (message.text or message.caption or "").strip(),
-        "chat_type": "private",
-        "timestamp": int((message.date or datetime.now()).timestamp()),
-        "is_forwarded": bool(message.forward_from or message.forward_sender_name),
-        "media_type": describe_media(message),
-        "media_path": media_path,
-        "media_mime": media_mime,
-    }
-    # Роль собеседника (папа/мама/кастомная) + правило интернет-поиска
-    role_suffix = _role_prompt_suffix(peer) + _internet_prompt_suffix(peer)
-    web_context = await _web_search_context(peer, payload["text"])
-    # История диалога (без текущего сообщения) для коротких реплик
-    history = _dialog_history_block(peer.id)
-    _push_dialog(peer.id, "peer", payload["text"])
-    payload["role_suffix"] = role_suffix
-    payload["web_context"] = web_context
-    payload["history"] = history
-    logger.info(
-        "Получено ЛС от %s (%s): %s%s",
-        payload["peer_id"],
-        payload["peer_name"],
-        payload["text"][:80] or "(без текста)",
-        f" + медиа ({media_mime})" if media_path else "",
-    )
-
     try:
+        payload: dict[str, Any] = {
+            "event": "incoming_message",
+            "peer_id": peer.id,
+            "peer_name": (
+                getattr(peer, "first_name", None)
+                or getattr(peer, "title", None)
+                or str(peer.id)
+            ),
+            "peer_username": getattr(peer, "username", None),
+            "message_id": message.id,
+            "text": (message.text or message.caption or "").strip(),
+            "chat_type": "private",
+            "timestamp": int((message.date or datetime.now()).timestamp()),
+            "is_forwarded": bool(message.forward_from or message.forward_sender_name),
+            "media_type": describe_media(message),
+            "media_path": media_path,
+            "media_mime": media_mime,
+        }
+        # Роль собеседника (папа/мама/кастомная) + правило интернет-поиска
+        role_suffix = _role_prompt_suffix(peer) + _internet_prompt_suffix(peer)
+        web_context = await _web_search_context(peer, payload["text"])
+        # История диалога (без текущего сообщения) для коротких реплик
+        history = _dialog_history_block(peer.id)
+        _push_dialog(peer.id, "peer", payload["text"])
+        payload["role_suffix"] = role_suffix
+        payload["web_context"] = web_context
+        payload["history"] = history
+        logger.info(
+            "Получено ЛС от %s (%s): %s%s",
+            payload["peer_id"],
+            payload["peer_name"],
+            payload["text"][:80] or "(без текста)",
+            f" + медиа ({media_mime})" if media_path else "",
+        )
+
         # Автопилот: для контактов из списка ответ уходит сразу, без кнопок
         if _is_auto_peer(peer):
             await handle_auto_reply(payload)
@@ -554,7 +564,7 @@ async def handle_incoming(message: Message) -> None:
         if not suggestions:
             await notify_owner(
                 f"⚠️ Не удалось получить варианты ответа для {payload['peer_name']}.\n"
-                "Проверьте GEMINI_API_KEY / GROQ_API_KEY в .env."
+                "Проверьте GEMINI_API_KEY / GROQ_API_KEY."
             )
             return
 
@@ -1286,6 +1296,16 @@ async def _handle_delete_intent(intent: dict) -> None:
 
 
 async def bot_handle_message(msg: dict[str, Any]) -> None:
+    """Глобальный предохранитель: любая ошибка при обработке сообщения бота
+    (команда, текст, фото, ГС) логируется, но бот не падает и не перезапускается."""
+    try:
+        await _bot_handle_message(msg)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ошибка при обработке сообщения/медиа: %s", exc)
+        return
+
+
+async def _bot_handle_message(msg: dict[str, Any]) -> None:
     """Сообщения владельца в чате с ботом: команды, контакт/правка для /con, правка черновика."""
     if (msg.get("from") or {}).get("id") != owner_id:
         return  # бот игнорирует посторонних

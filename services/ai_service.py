@@ -463,3 +463,28 @@ async def generate_content(instruction: str) -> list[str]:
     variants = _parse_suggestions(raw) if raw else []
     shared.logger.info("Сгенерировано текстов по запросу: %s", len(variants))
     return variants
+
+
+_DIRECT_SEND_SYSTEM_PROMPT = (
+    "Ты — ассистент, который помогает сформулировать естественное "
+    "короткое сообщение для Telegram. На основе заданной темы сгенерируй "
+    "одно готовое сообщение от первого лица (от имени владельца аккаунта). "
+    "Пиши просто, естественно, как живой человек. Без пояснений, без "
+    "преамбул — только готовое сообщение."
+)
+
+
+async def generate_direct_send_text(topic: str) -> Optional[str]:
+    """Генерирует естественное сообщение для Telegram на основе темы.
+
+    Используется при прямой отправке: пользователь указывает тему
+    (например, "привет" или "как дела"), а ИИ формулирует
+    готовое сообщение для отправки собеседнику.
+    """
+    raw = await _generate_with_fallback(
+        _DIRECT_SEND_SYSTEM_PROMPT,
+        f"Тема: {topic}",
+    )
+    if raw:
+        shared.logger.info("Сгенерировано сообщение для прямой отправки: %s", raw[:80])
+    return raw

@@ -82,6 +82,7 @@ from services.ai_service import (
     _push_dialog,
     detect_direct_send_intent,
     detect_delete_intent,
+    generate_direct_send_text,
     generate_suggestions,
     refine_draft,
 )
@@ -652,19 +653,22 @@ async def handle_callback(cb: CallbackQuery) -> None:
         if chat_id is None:
             await _safe_answer(cb, "❌ Контакт не найден")
             return
+        await _safe_answer(cb, "Генерация текста…")
+        generated = await generate_direct_send_text(text)
+        send_text = generated or text
         try:
-            sent_msg = await client.send_message(chat_id, text)
+            sent_msg = await client.send_message(chat_id, send_text)
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось отправить сообщение в %s", target)
             await _safe_answer(cb, "⚠️ Не удалось отправить")
             return
         DIRECT_SEND_CTX.pop(message_id, None)
-        _push_dialog(chat_id, "me", text)
+        _push_dialog(chat_id, "me", send_text)
         await _safe_answer(cb, "Отправлено ✅")
         await _replace_buttons_with_status(
             cb,
             f"✅ Отправлено пользователю {esc_md(target_name)}:"
-            f" {esc_md(text[:100])}",
+            f" {esc_md(send_text[:100])}",
         )
         try:
             await cb.message.edit_reply_markup(
@@ -681,10 +685,14 @@ async def handle_callback(cb: CallbackQuery) -> None:
 
     if action.startswith("dedit|"):
         _, target, text = action.split("|", 2)
-        await _safe_answer(cb, "Режим правки — отправьте новое текстовое сообщение")
+        await _safe_answer(cb, "✏️ Режим правки")
         EDIT_CTX[message_id] = EditCtx(
             peer_id=0, peer_name=target, peer_msg_id=0,
             original=text, draft=text,
+        )
+        await cb.message.reply(
+            "✍️ Напиши в чат, что изменить "
+            "(например: «сделай вежливее» или «добавь про встречу»)"
         )
         return
 
@@ -920,26 +928,29 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
         if chat_id2 is None:
             await bot_api.answer_callback_query(cb_id, "❌ Контакт не найден")
             return
+        await bot_api.answer_callback_query(cb_id, "Генерация текста…")
+        generated = await generate_direct_send_text(text)
+        send_text = generated or text
         try:
-            sent_msg = await client.send_message(chat_id2, text)
+            sent_msg = await client.send_message(chat_id2, send_text)
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось отправить сообщение в %s", target)
             await bot_api.answer_callback_query(cb_id, "⚠️ Не удалось отправить")
             return
         DIRECT_SEND_CTX.pop(message_id, None)
-        _push_dialog(chat_id2, "me", text)
+        _push_dialog(chat_id2, "me", send_text)
         await bot_api.answer_callback_query(cb_id, "Отправлено ✅")
         await bot_edit_with_status(
             chat_id, message_id, base,
             f"✅ Отправлено пользователю {esc_html(target_name)}:"
-            f" {esc_html(text[:100])}",
+            f" {esc_html(send_text[:100])}",
         )
         try:
             await bot_api.edit_message_text(
                 owner_id, message_id,
                 (base + "\n\n" + esc_html(
                     f"✅ Отправлено пользователю {target_name}:"
-                    f" {text[:100]}"
+                    f" {send_text[:100]}"
                 )),
                 parse_mode="HTML",
                 reply_markup={"inline_keyboard": [[
@@ -953,10 +964,15 @@ async def bot_handle_callback(cb: dict[str, Any]) -> None:
 
     if action.startswith("dedit|"):
         _, target, text = action.split("|", 2)
-        await bot_api.answer_callback_query(cb_id, "Режим правки — отправьте новое текстовое сообщение")
+        await bot_api.answer_callback_query(cb_id, "✏️ Режим правки")
         EDIT_CTX[message_id] = EditCtx(
             peer_id=0, peer_name=target, peer_msg_id=0,
             original=text, draft=text,
+        )
+        await bot_api.send_message(
+            owner_id,
+            "✍️ Напиши в чат, что изменить "
+            "(например: «сделай вежливее» или «добавь про встречу»)",
         )
         return
 

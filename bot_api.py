@@ -100,6 +100,14 @@ class BotApiClient:
     def __init__(self, token: str, http_session: aiohttp.ClientSession) -> None:
         self._token = token
         self._session = http_session
+        self._message_processor: Optional[Callable[..., Awaitable[None]]] = None
+
+    def register_message_processor(self, func: Callable[..., Awaitable[None]]) -> None:
+        """Регистрирует обработчик сообщений для crash-guard'а bot_handle_message.
+
+        Обработчик вызывается как async (message, raw_text, media_path, media_mime).
+        """
+        self._message_processor = func
 
     async def call(self, method: str, timeout: int = 70, **params: Any) -> Any:
         """Вызывает метод Bot API (POST, JSON). Возвращает поле result.
@@ -271,8 +279,10 @@ async def bot_handle_message(message: dict[str, Any]) -> None:
         if client is not None:
             media_path, media_mime = await client.download_media(message)
 
-        # 3) Текстовые проверки/команды и передача media_path/media_mime в ai_service
-        processor = _message_processor
+        # 3) Текстовые проверки/команды и передача media_path/media_mime в ai_service.
+        #    Обработчик: сначала зарегистрированный на экземпляре клиента
+        #    (client.register_message_processor), иначе — на уровне модуля.
+        processor = getattr(client, "_message_processor", None) or _message_processor
         if processor is not None:
             await processor(message, raw_text, media_path, media_mime)
     except Exception as exc:  # noqa: BLE001

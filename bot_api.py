@@ -11,6 +11,16 @@ inline-кнопками [1] [2] [3] отправляется через Bot API 
 from __future__ import annotations
 
 import asyncio
+
+# Совместимость с Python 3.14: pyrogram (в т.ч. через services.shared) при импорте
+# вызывает asyncio.get_event_loop(), который без активного цикла кидает RuntimeError.
+# Инициализируем цикл ДО импорта pyrogram и services.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 import contextlib
 import logging
 import os

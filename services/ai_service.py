@@ -111,9 +111,27 @@ def detect_direct_send_intent(text: str) -> Optional[Intent]:
     return Intent(action="send_direct", target=parts[0], text=parts[1].strip())
 
 _DELETE_INTENT_RE = re.compile(
-    r"^удали\s+(\d+)?\s*(?:последнее|последних)?\s*(?:сообщение|сообщения|сообщений)?\s*(?:у|пользователю)\s+(.+)$",
+    r"^удали\s+(\d+)?\s*(?:последнее|последних|последние)?\s*(?:сообщение|сообщения|сообщений)?\s*(?:у|пользователю)\s+(.+)$",
     re.IGNORECASE,
 )
+
+# Мусорные слова в начале/конце имени контакта для команды удаления
+_DELETE_TARGET_FILLER = frozenset(
+    {"контакта", "контакт", "пользователя", "пользователю", "юзера", "юзеру", "у", "для"}
+)
+
+
+def _clean_delete_target(raw: str) -> str:
+    """Убирает мусорные слова из начала и конца имени контакта.
+
+    Пример: «у контакта улу» -> «улу» (слова «контакта» и «у» удаляются).
+    """
+    parts = raw.split()
+    while parts and parts[0].lower().strip(".,!?") in _DELETE_TARGET_FILLER:
+        parts.pop(0)
+    while parts and parts[-1].lower().strip(".,!?") in _DELETE_TARGET_FILLER:
+        parts.pop()
+    return " ".join(parts)
 
 
 def detect_delete_intent(text: str) -> Optional[dict]:
@@ -123,6 +141,10 @@ def detect_delete_intent(text: str) -> Optional[dict]:
       «удали последнее сообщение у Улу»
       «удали 3 последних сообщения у @username»
       «удали последние сообщения у пользователя Улу»
+      «удали последнее сообщение у контакта улу» -> имя чистится до «улу»
+
+    Мусорные слова ("контакта", "пользователя", "юзера", "у", "для") в начале
+    и конце имени автоматически удаляются.
 
     Возвращает {"action": "delete", "count": N, "target": name} или None.
     """
@@ -130,7 +152,9 @@ def detect_delete_intent(text: str) -> Optional[dict]:
     if not m:
         return None
     count_str = m.group(1)
-    target = m.group(2).strip()
+    target = _clean_delete_target(m.group(2).strip())
+    if not target:
+        return None
     count = int(count_str) if count_str else 1
     return {"action": "delete", "count": count, "target": target}
 

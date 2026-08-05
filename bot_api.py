@@ -90,6 +90,68 @@ async def _notify_owner(text: str) -> None:
             await client.send_message(owner_id, text)
 
 
+async def _process_message(
+    client: Optional["BotApiClient"], message: dict[str, Any]
+) -> None:
+    """Общая crash-guarded логика обработки входящего сообщения.
+
+    Безопасно достаёт текст (текст или подпись к медиа), скачивает фото/ГС/аудио
+    в MEDIA_TMP_DIR и передаёт media_path/media_mime зарегистрированному
+    обработчику (или генерирует ответ через ai_service). Любая ошибка логируется
+    и уходит владельцу («⚠️ Ошибка: …»), процесс НЕ падает.
+    В finally ВСЕГДА удаляется временный файл из MEDIA_TMP_DIR.
+    """
+    media_path: Optional[str] = None
+    try:
+        owner_id = getattr(shared, "owner_id", None)
+        sender_id = (message.get("from") or {}).get("id")
+        if owner_id is not None and sender_id != owner_id:
+            return  # чужие сообщения не обрабатываем и не скачиваем их медиа
+
+        # 1) Безопасное извлечение текста: текст или подпись (caption) к медиа
+        raw_text = (message.get("text") or message.get("caption") or "").strip()
+        if not raw_text and not (
+            message.get("photo") or message.get("voice") or message.get("audio")
+        ):
+            return  # нет ни текста, ни медиа — обрабатывать нечего
+
+        # 2) Скачивание фото/ГС/аудио в MEDIA_TMP_DIR (photo.jpg / voice.ogg)
+        media_mime: Optional[str] = None
+        if client is not None:
+            media_path, media_mime = await client.download_media(message)
+
+        # 3) Передача текста и media_path/media_mime в ai_service:
+        #    сначала зарегистрированный обработчик (экземпляр/модуль),
+        #    если его нет — генерируем варианты ответа напрямую через ai_service.
+        processor = getattr(client, "_message_processor", None) or _message_processor
+        if processor is not None:
+            await processor(message, raw_text, media_path, media_mime)
+        elif raw_text:
+            try:
+                from services.ai_service import generate_suggestions
+
+                suggestions = await generate_suggestions(
+                    raw_text,
+                    "Владелец",
+                    media_path=media_path,
+                    media_mime=media_mime,
+                )
+                if suggestions:
+                    body = "\n".join(
+                        f"{i}. {s}" for i, s in enumerate(suggestions, 1)
+                    )
+                    await _notify_owner(f"Варианты ответа:\n{body}")
+            except Exception:  # noqa: BLE001
+                logger.exception("ai_service fallback не сработал")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ошибка обработки медиа: %s", exc)
+        with contextlib.suppress(Exception):
+            await _notify_owner(f"⚠️ Ошибка: {exc}")
+    finally:
+        # ВСЕГДА удаляем временный файл из MEDIA_TMP_DIR
+        cleanup_temp_file(media_path)
+
+
 class BotApiError(RuntimeError):
     """Ошибка Telegram Bot API (сеть, статус, поле ok:false)."""
 
@@ -108,6 +170,17 @@ class BotApiClient:
         Обработчик вызывается как async (message, raw_text, media_path, media_mime).
         """
         self._message_processor = func
+
+    async def bot_handle_message(self, message: dict[str, Any]) -> None:
+        """Crash-guarded обработчик входящего сообщения (метод экземпляра).
+
+        Принимает объект message от Telegram Bot API, извлекает текст/подпись,
+        при наличии photo/voice/audio скачивает файл в MEDIA_TMP_DIR и передаёт
+        media_path/media_mime в ai_service через зарегистрированный обработчик
+        (или генерирует ответ через ai_service). Любая ошибка логируется и уходит
+        владельцу, процесс НЕ падает. В finally ВСЕГДА удаляется временный файл.
+        """
+        await _process_message(self, message)
 
     async def call(self, method: str, timeout: int = 70, **params: Any) -> Any:
         """Вызывает метод Bot API (POST, JSON). Возвращает поле result.
@@ -250,48 +323,12 @@ class BotApiClient:
 
 
 async def bot_handle_message(message: dict[str, Any]) -> None:
-    """Главный предохранитель (Crash Guard) для входящих сообщений бота.
+    """Глобальный crash-guard для входящих сообщений бота (уровень модуля).
 
-    Безопасно достаёт текст (текст или подпись к медиа), скачивает фото/ГС/аудио
-    в MEDIA_TMP_DIR и передаёт media_path/media_mime в ai_service через
-    зарегистрированный обработчик (register_message_processor). Любая ошибка
-    логируется и отправляется владельцу («⚠️ Ошибка обработки медиа: …»),
-    процесс bot_api.py НЕ падает и НЕ перезапускается. В finally ВСЕГДА удаляется
-    временный файл из MEDIA_TMP_DIR.
+    Дополнение к bot_handle_message() внутри BotApiClient: используется, когда
+    bot_api используется напрямую как модуль (без экземпляра клиента).
     """
-    media_path: Optional[str] = None
-    try:
-        owner_id = getattr(shared, "owner_id", None)
-        sender_id = (message.get("from") or {}).get("id")
-        if owner_id is not None and sender_id != owner_id:
-            return  # чужие сообщения не обрабатываем и не скачиваем их медиа
-
-        # 1) Безопасное извлечение текста: текст или подпись (caption) к медиа
-        raw_text = (message.get("text") or message.get("caption") or "").strip()
-        if not raw_text and not (
-            message.get("photo") or message.get("voice") or message.get("audio")
-        ):
-            return  # нет ни текста, ни медиа — обрабатывать нечего
-
-        # 2) Скачивание фото/ГС/аудио в MEDIA_TMP_DIR (photo.jpg / voice.ogg)
-        client = getattr(shared, "bot_api", None)
-        media_mime: Optional[str] = None
-        if client is not None:
-            media_path, media_mime = await client.download_media(message)
-
-        # 3) Текстовые проверки/команды и передача media_path/media_mime в ai_service.
-        #    Обработчик: сначала зарегистрированный на экземпляре клиента
-        #    (client.register_message_processor), иначе — на уровне модуля.
-        processor = getattr(client, "_message_processor", None) or _message_processor
-        if processor is not None:
-            await processor(message, raw_text, media_path, media_mime)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Ошибка обработки медиа: %s", exc)
-        with contextlib.suppress(Exception):
-            await _notify_owner(f"⚠️ Ошибка обработки медиа: {exc}")
-    finally:
-        # ВСЕГДА удаляем временный файл из MEDIA_TMP_DIR
-        cleanup_temp_file(media_path)
+    await _process_message(getattr(shared, "bot_api", None), message)
 
 
 class BotApiPoller:

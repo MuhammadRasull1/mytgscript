@@ -354,12 +354,14 @@ async def _download_media(source: Any) -> tuple[Optional[str], Optional[str]]:
 
 async def handle_incoming(message: Message) -> None:
     """Глобальный предохранитель: любая ошибка при обработке входящего сообщения
-    (текст, фото, ГС, команды) логируется, но бот не падает и не перезапускается."""
+    (текст, фото, ГС, команды) логируется и уходит владельцу, но бот не падает
+    и не перезапускается."""
     try:
         await _handle_incoming(message)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка при обработке сообщения/медиа: %s", exc)
-        return
+        with contextlib.suppress(Exception):
+            await notify_owner(f"⚠️ Ошибка: {exc}")
 
 
 async def _handle_incoming(message: Message) -> None:
@@ -990,7 +992,7 @@ async def bot_handle_update(update: dict[str, Any]) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка обработки: %s", exc)
             with contextlib.suppress(Exception):
-                await notify_owner(f"⚠️ Ошибка обработки: {exc}")
+                await notify_owner(f"⚠️ Ошибка: {exc}")
         return
 
     if bot_api is None:
@@ -1264,47 +1266,69 @@ async def _handle_direct_send(target: str, text: str) -> Optional[str]:
 
 
 async def _handle_delete_intent(intent: dict) -> None:
-    """Обрабатывает команду удаления последних сообщений у собеседника."""
+    """Обрабатывает команду удаления последних сообщений у собеседника.
+
+    По target определяется чат (сначала client.get_chat, затем _resolve_chat),
+    в истории диалога (limit=10) находится последнее своё сообщение и удаляется
+    через msg.delete(). Подтверждение уходит в чат управления.
+    """
     target = intent.get("target", "")
-    count = intent.get("count", 1)
-    chat_id, target_name = await _resolve_chat(target)
+    count = max(int(intent.get("count", 1) or 1), 1)
+
+    # 1) Определяем chat_id: сначала точный get_chat, затем поиск по имени
+    chat_id: Optional[int] = None
+    target_name = target
+    try:
+        chat = await client.get_chat(target)
+        chat_id = chat.id
+        target_name = (
+            getattr(chat, "first_name", None)
+            or getattr(chat, "title", None)
+            or getattr(chat, "username", None)
+            or target
+        )
+    except Exception:  # noqa: BLE001
+        resolved = await _resolve_chat(target)
+        if resolved is not None and resolved[0] is not None:
+            chat_id, resolved_name = resolved
+            if resolved_name:
+                target_name = resolved_name
+
     if chat_id is None:
         await bot_api.send_message(
             owner_id,
             f"❌ Не нашёл контакт/чат с именем «{esc_html(target)}».",
         )
         return
+
+    # 2) Ищем последние свои сообщения в истории (limit=10) и удаляем их
+    deleted = 0
     try:
-        history = await client.get_chat_history(chat_id, limit=count)
-    except Exception:  # noqa: BLE001
-        logger.exception("Не удалось получить историю чата %s", chat_id)
-        await bot_api.send_message(
-            owner_id,
-            f"⚠️ Не удалось получить историю чата с {esc_html(target_name)}.",
-        )
-        return
-    messages_to_delete = [m.id for m in history if m.outgoing]
-    if not messages_to_delete:
-        await bot_api.send_message(
-            owner_id,
-            f"ℹ️ Нет входящих сообщений для удаления в чате с {esc_html(target_name)}.",
-        )
-        return
-    try:
-        await client.delete_messages(chat_id, messages_to_delete)
-    except Exception:  # noqa: BLE001
+        async for msg in client.get_chat_history(chat_id, limit=10):
+            if msg.from_user and msg.from_user.is_self:
+                await msg.delete()
+                deleted += 1
+                if deleted >= count:
+                    break
+    except Exception as exc:  # noqa: BLE001
         logger.exception("Не удалось удалить сообщения в чате %s", chat_id)
         await bot_api.send_message(
             owner_id,
             f"⚠️ Не удалось удалить сообщения в чате с {esc_html(target_name)}.",
         )
         return
+
+    if not deleted:
+        await bot_api.send_message(
+            owner_id,
+            f"ℹ️ Нет сообщений для удаления в чате с {esc_html(target_name)}.",
+        )
+        return
+
+    # 3) Подтверждение в чат управления
     await bot_api.send_message(
         owner_id,
-        f"🗑 Удалено {len(messages_to_delete)} последни"
-        f"{'х' if count == 1 else 'х'} сообщени"
-        f"{'е' if count == 1 else 'я' if count < 5 else 'й'} "
-        f"в чате с {esc_html(target_name)}.",
+        f"🗑 Последнее сообщение у {esc_html(target_name)} успешно удалено",
     )
 
 

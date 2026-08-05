@@ -310,44 +310,28 @@ async def _download_media(source: Any) -> tuple[Optional[str], Optional[str]]:
 
     Понимает оба режима по типу источника:
     - Pyrogram Message (входящие ЛС): скачивает через message.download(file_name=...);
-    - dict сообщения Bot API (режим bot_chat): берёт file_id (photo[-1] / voice /
-      audio), запрашивает путь через bot_api.get_file(file_id) и скачивает байты
-      по URL в data/tmp.
+    - dict сообщения Bot API (режим bot_chat): делегирует скачивание фото/ГС/аудио
+      в bot_api.py (bot_api.download_media: get_file -> байты в MEDIA_TMP_DIR).
 
     Возвращает (путь, mime_type) или (None, None), если медиа нет или скачивание
     не удалось (в этом случае файл чистится сразу и бот НЕ падает).
     """
     is_bot_api = isinstance(source, dict)
-    mime: Optional[str] = None
-    file_id: Optional[str] = None
-
     if is_bot_api:
-        photos = source.get("photo") or []
-        if photos:
-            file_id = photos[-1].get("file_id")
-            mime = "image/jpeg"
-        elif source.get("voice"):
-            file_id = source["voice"].get("file_id")
-            mime = source["voice"].get("mime_type") or "audio/ogg"
-        elif source.get("audio"):
-            file_id = source["audio"].get("file_id")
-            mime = source["audio"].get("mime_type") or "audio/mpeg"
-        else:
+        # Режим Bot API (bot_chat): фото/ГС/аудио скачивает bot_api.py
+        # (get_file -> байты в MEDIA_TMP_DIR как photo.jpg / voice.ogg)
+        if bot_api is None:
             return None, None
-        if not file_id:
-            logger.info("Получено медиа (%s), нет file_id — пропускаем", mime)
-            return None, None
-    else:
-        if source.photo:
-            mime = "image/jpeg"
-        elif source.voice:
-            mime = getattr(source.voice, "mime_type", None) or "audio/ogg"
-        elif source.audio:
-            mime = getattr(source.audio, "mime_type", None) or "audio/mpeg"
-        else:
-            return None, None
+        return await bot_api.download_media(source)
 
-    if not mime:
+    mime: Optional[str] = None
+    if source.photo:
+        mime = "image/jpeg"
+    elif source.voice:
+        mime = getattr(source.voice, "mime_type", None) or "audio/ogg"
+    elif source.audio:
+        mime = getattr(source.audio, "mime_type", None) or "audio/mpeg"
+    else:
         return None, None
 
     path: Optional[str] = None
@@ -355,18 +339,11 @@ async def _download_media(source: Any) -> tuple[Optional[str], Optional[str]]:
         os.makedirs(MEDIA_TMP_DIR, exist_ok=True)
         name = f"dl_{uuid.uuid4().hex}{_media_extension(mime)}"
         path = os.path.join(MEDIA_TMP_DIR, name)
-        if is_bot_api:
-            file_info = await bot_api.get_file(file_id)
-            file_path = (file_info or {}).get("file_path")
-            if not file_path:
-                raise BotApiError("getFile не вернул file_path")
-            await bot_api.download_file(file_path, path)
-        else:
-            downloaded = await source.download(file_name=path)
-            if not downloaded:
-                logger.info("Получено медиа (%s), скачивание не удалось — пропускаем", mime)
-                _cleanup_temp_file(path)
-                return None, None
+        downloaded = await source.download(file_name=path)
+        if not downloaded:
+            logger.info("Получено медиа (%s), скачивание не удалось — пропускаем", mime)
+            _cleanup_temp_file(path)
+            return None, None
     except Exception:  # noqa: BLE001
         logger.exception("Получено медиа (%s), скачивание упало — пропускаем", mime)
         _cleanup_temp_file(path)
@@ -1002,10 +979,10 @@ HELP_TEXT = (
 async def bot_handle_update(update: dict[str, Any]) -> None:
     """Точка входа для обновлений из long-polling бота.
 
-    Железобетонный предохранитель: любая ошибка при обработке обновления
-    логируется и уходит владельцу («⚠️ Ошибка обработки: …»), но процесс
-    никогда не падает. В finally вычищаются временные медиафайлы, скачанные
-    во время обработки этого обновления (страховка поверх per-site finally).
+    Нажатия кнопок обрабатываются здесь; сообщения идут через crash-guard
+    bot_api.py (bot_handle_message): там медиа (фото/ГС) скачиваются в
+    MEDIA_TMP_DIR и передаются в ai_service, ошибки уходят владельцу, процесс
+    никогда не падает.
     """
     if "callback_query" in update:
         try:
@@ -1016,16 +993,10 @@ async def bot_handle_update(update: dict[str, Any]) -> None:
                 await notify_owner(f"⚠️ Ошибка обработки: {exc}")
         return
 
-    before = set(_ACTIVE_TEMP_FILES)
-    try:
-        await bot_handle_message(update["message"])
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Ошибка обработки: %s", exc)
-        with contextlib.suppress(Exception):
-            await notify_owner(f"⚠️ Ошибка обработки: {exc}")
-    finally:
-        for path in set(_ACTIVE_TEMP_FILES) - before:
-            _cleanup_temp_file(path)
+    if bot_api is None:
+        logger.error("bot_api не инициализирован — сообщение пропущено")
+        return
+    await bot_api.bot_handle_message(update["message"])
 
 
 async def bot_handle_callback(cb: dict[str, Any]) -> None:
@@ -1337,21 +1308,22 @@ async def _handle_delete_intent(intent: dict) -> None:
     )
 
 
-async def bot_handle_message(msg: dict[str, Any]) -> None:
-    """Глобальный предохранитель: любая ошибка при обработке сообщения бота
-    (команда, текст, фото, ГС) логируется, но бот не падает и не перезапускается."""
-    try:
-        await _bot_handle_message(msg)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Ошибка при обработке сообщения/медиа: %s", exc)
-        return
+async def _bot_handle_message(
+    msg: dict[str, Any],
+    raw_text: str,
+    media_path: Optional[str],
+    media_mime: Optional[str],
+) -> None:
+    """Сообщения владельца в чате с ботом: команды, контакт/правка для /con,
+    правка черновика.
 
-
-async def _bot_handle_message(msg: dict[str, Any]) -> None:
-    """Сообщения владельца в чате с ботом: команды, контакт/правка для /con, правка черновика."""
+    Вызывается через crash-guard bot_api.py (register_message_processor): текст
+    уже извлечён безопасно (raw_text), медиа (фото/ГС/аудио) уже скачано в
+    MEDIA_TMP_DIR (media_path/media_mime) и уйдёт в ai_service.
+    """
     if (msg.get("from") or {}).get("id") != owner_id:
         return  # бот игнорирует посторонних
-    text = (msg.get("text") or msg.get("caption") or "").strip()
+    text = raw_text
     reply_to = msg.get("reply_to_message") or {}
     bot_msg_id = reply_to.get("message_id")
 
@@ -1362,19 +1334,15 @@ async def _bot_handle_message(msg: dict[str, Any]) -> None:
     if text and not lower.startswith(("напиши", "отправь", "удали", "/")):
         draft = ACTIVE_DRAFT.get("current") or ACTIVE_DRAFT.get(owner_id)
         if draft is not None:
-            media_path, media_mime = await _download_media(msg)
             try:
-                try:
-                    new_text = await rewrite_draft(
-                        draft["text"], text,
-                        media_path=media_path, media_mime=media_mime,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("Ошибка при обработке медиа: %s", exc)
-                    await notify_owner(f"⚠️ Не удалось обработать медиа: {exc}")
-                    return
-            finally:
-                _cleanup_temp_file(media_path)
+                new_text = await rewrite_draft(
+                    draft["text"], text,
+                    media_path=media_path, media_mime=media_mime,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ошибка при обработке медиа: %s", exc)
+                await notify_owner(f"⚠️ Не удалось обработать медиа: {exc}")
+                return
             if not new_text:
                 await bot_api.send_message(
                     owner_id, "⚠️ Не удалось переписать текст. Попробуйте ещё раз."
@@ -1486,7 +1454,6 @@ async def _bot_handle_message(msg: dict[str, Any]) -> None:
 
     intent = detect_direct_send_intent(text)
     if intent is not None:
-        media_path, media_mime = await _download_media(msg)
         try:
             chat_id, target_name = await _resolve_chat(intent.target)
             if chat_id is None:
@@ -1538,6 +1505,7 @@ async def _bot_handle_message(msg: dict[str, Any]) -> None:
                 "chat_id": chat_id,
             }
         finally:
+            # Временный файл медиа удаляет crash-guard bot_api.py
             _cleanup_temp_file(media_path)
         return
 
@@ -1685,6 +1653,8 @@ async def main() -> None:
             raise SystemExit("AI_MODE=bot_chat требует BOT_TOKEN в .env (токен бота из BotFather)")
         bot_api = BotApiClient(CFG.bot_token, http_session)
         shared.bot_api = bot_api
+        # Регистрируем обработчик сообщений: crash-guard и медиа (фото/ГС) в bot_api.py
+        bot_api.register_message_processor(_bot_handle_message)
         try:
             me = await bot_api.get_me()
         except BotApiError as exc:

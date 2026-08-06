@@ -676,6 +676,27 @@ async def rewrite_draft(
     return rewritten
 
 
+_PHOTO_ANALYSIS_SYSTEM_PROMPT = (
+    "Ты — ассистент, который анализирует и описывает содержимое фотографий. "
+    "Отвечай на русском языке, по существу, без лишних вступлений."
+)
+
+
+async def analyze_photo(question: str, media_path: str, media_mime: str) -> Optional[str]:
+    """Анализирует фото по вопросу владельца (Gemini vision; Groq-фоллбек фото не видит).
+
+    question — текст/подпись владельца ("что на фото", "опиши" и т.п.);
+    media_path/media_mime — путь к скачанному фото и его MIME.
+    """
+    user_prompt = question.strip() or "Опиши, что изображено на фото."
+    raw = await _generate_with_fallback(
+        _PHOTO_ANALYSIS_SYSTEM_PROMPT, user_prompt, media_path=media_path, media_mime=media_mime
+    )
+    if raw:
+        shared.logger.info("Фото проанализировано: %s", raw[:80])
+    return raw
+
+
 async def generate_content(instruction: str) -> list[str]:
     """Генерация 3 готовых текстов по произвольному запросу (команда /con)."""
     raw = await _generate_with_fallback(

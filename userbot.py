@@ -81,6 +81,7 @@ from services.ai_service import (
     Intent,
     _dialog_history_block,
     _push_dialog,
+    analyze_photo,
     detect_direct_send_intent,
     detect_delete_intent,
     generate_direct_send_text,
@@ -352,6 +353,15 @@ async def _download_media(source: Any) -> tuple[Optional[str], Optional[str]]:
     return path, mime
 
 
+_PHOTO_ANALYSIS_KEYWORDS = ("что на фото", "что это", "опиши", "проанализируй")
+
+
+def _is_photo_analysis_request(text: str) -> bool:
+    """Проверяет, похож ли текст на запрос анализа фото ("что на фото", "опиши" и т.п.)."""
+    lower = (text or "").lower()
+    return any(kw in lower for kw in _PHOTO_ANALYSIS_KEYWORDS)
+
+
 async def handle_incoming(message: Message) -> None:
     """Глобальный предохранитель: любая ошибка при обработке входящего сообщения
     (текст, фото, ГС, команды) логируется и уходит владельцу, но бот не падает
@@ -373,6 +383,41 @@ async def _handle_incoming(message: Message) -> None:
         return
     raw_text = (message.text or message.caption or "").strip()
     lower = raw_text.lower()
+
+    # Анализ фото владельца в служебном чате: фото с подписью (любой), либо
+    # ответ на сообщение с фото ("что это?", "опиши" и т.п.) — Gemini vision
+    # через уже существующую мультимодальную логику (services.ai_service).
+    if message.chat.id == service_chat_id:
+        photo_source: Optional[Message] = None
+        if message.photo and raw_text:
+            photo_source = message
+        elif (
+            message.reply_to_message
+            and message.reply_to_message.photo
+            and _is_photo_analysis_request(raw_text)
+        ):
+            photo_source = message.reply_to_message
+        if photo_source is not None:
+            media_path, media_mime = await _download_media(photo_source)
+            try:
+                if media_path is None:
+                    await client.send_message(
+                        service_chat_id, "⚠️ Не удалось скачать фото. Попробуйте ещё раз."
+                    )
+                    return
+                try:
+                    description = await analyze_photo(raw_text, media_path, media_mime)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Ошибка анализа фото: %s", exc)
+                    await notify_owner(f"⚠️ Не удалось проанализировать фото: {exc}")
+                    return
+                await client.send_message(
+                    service_chat_id,
+                    description or "⚠️ Не удалось проанализировать фото. Попробуйте ещё раз.",
+                )
+            finally:
+                _cleanup_temp_file(media_path)
+            return
 
     # Правка активного черновика ПЕРВОЙ: простое сообщение (не "напиши/отправь/
     # удали" и не команда) в управляющем чате, пока есть активный черновик —
@@ -1350,6 +1395,32 @@ async def _bot_handle_message(
     text = raw_text
     reply_to = msg.get("reply_to_message") or {}
     bot_msg_id = reply_to.get("message_id")
+
+    # Анализ фото владельца: текущее фото с любой подписью, либо ответ на
+    # сообщение с фото ("что это?", "опиши" и т.п.) — Gemini vision через уже
+    # существующую мультимодальную логику (services.ai_service).
+    photo_path: Optional[str] = None
+    photo_mime: Optional[str] = None
+    cleanup_photo = False
+    if media_path and media_mime and "image" in media_mime and text:
+        photo_path, photo_mime = media_path, media_mime
+    elif reply_to.get("photo") and _is_photo_analysis_request(text):
+        photo_path, photo_mime = await bot_api.download_media(reply_to)
+        cleanup_photo = True
+    if photo_path and photo_mime:
+        try:
+            description = await analyze_photo(text, photo_path, photo_mime)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка анализа фото: %s", exc)
+            await notify_owner(f"⚠️ Не удалось проанализировать фото: {exc}")
+            return
+        finally:
+            if cleanup_photo:
+                _cleanup_temp_file(photo_path)
+        await bot_api.send_message(
+            owner_id, description or "⚠️ Не удалось проанализировать фото. Попробуйте ещё раз."
+        )
+        return
 
     # Правка активного черновика ПЕРВОЙ: простое сообщение (не "напиши/отправь/
     # удали" и не команда), пока есть активный черновик — переписываем текст и

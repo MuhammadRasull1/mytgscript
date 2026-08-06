@@ -159,6 +159,15 @@ def detect_delete_intent(text: str) -> Optional[dict]:
     return {"action": "delete", "count": count, "target": target}
 
 
+_CONTENT_INTENT_VERBS = ("придумай", "сгенерируй", "сочини", "пожелай", "поздравь")
+
+
+def detect_content_intent(text: str) -> bool:
+    """Определяет намерение «сгенерируй текст» без явного получателя (аналог
+    команды /con) — например, «Придумай отмазку…», «Поздравь маму с ДР»."""
+    return text.strip().lower().startswith(_CONTENT_INTENT_VERBS)
+
+
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 # На сколько секунд замораживать ключ Gemini после ошибки квоты (429)
@@ -697,28 +706,30 @@ async def analyze_photo(question: str, media_path: str, media_mime: str) -> Opti
     return raw
 
 
-_VOICE_ANALYSIS_SYSTEM_PROMPT = (
-    "Ты — ассистент, который распознаёт речь в голосовых/аудио сообщениях. "
-    "Если это вопрос или просьба — ответь по существу; если это просто "
-    "диктовка — приведи распознанный текст. Отвечай на русском языке, "
-    "без лишних вступлений."
+_TRANSCRIBE_SYSTEM_PROMPT = (
+    "Ты — сервис распознавания речи (STT). Верни ТОЛЬКО точный текст того, что "
+    "сказано в аудио, на языке оригинала, без пояснений, комментариев, кавычек "
+    "и вступлений. Если речи нет или она неразборчива — верни пустую строку."
 )
 
 
-async def analyze_voice(question: str, media_path: str, media_mime: str) -> Optional[str]:
-    """Распознаёт голосовое/аудио сообщение и отвечает по нему (Gemini audio;
-    Groq-фоллбек аудио не слышит).
+async def transcribe_voice(media_path: str, media_mime: str) -> Optional[str]:
+    """Распознаёт речь в голосовом/аудио сообщении (Gemini audio; Groq-фоллбек
+    аудио не слышит).
 
-    question — сопроводительный текст/подпись владельца (может быть пустым);
-    media_path/media_mime — путь к скачанному аудио и его MIME.
+    Возвращает только распознанный текст — дальше он обрабатывается как обычное
+    текстовое сообщение владельца тем же пайплайном команд/намерений.
     """
-    user_prompt = question.strip() or "Распознай и обработай голосовое сообщение."
     raw = await _generate_with_fallback(
-        _VOICE_ANALYSIS_SYSTEM_PROMPT, user_prompt, media_path=media_path, media_mime=media_mime
+        _TRANSCRIBE_SYSTEM_PROMPT,
+        "Распознай текст в аудио.",
+        media_path=media_path,
+        media_mime=media_mime,
     )
-    if raw:
-        shared.logger.info("Голосовое сообщение обработано: %s", raw[:80])
-    return raw
+    text = (raw or "").strip()
+    if text:
+        shared.logger.info("Голосовое сообщение распознано: %s", text[:80])
+    return text or None
 
 
 async def generate_content(instruction: str) -> list[str]:

@@ -82,13 +82,14 @@ from services.ai_service import (
     _dialog_history_block,
     _push_dialog,
     analyze_photo,
-    analyze_voice,
+    detect_content_intent,
     detect_direct_send_intent,
     detect_delete_intent,
     generate_direct_send_text,
     generate_suggestions,
     refine_draft,
     rewrite_draft,
+    transcribe_voice,
 )
 from services.con_handler import (
     GenCtx,
@@ -398,6 +399,34 @@ async def _handle_incoming(message: Message) -> None:
     raw_text = (message.text or message.caption or "").strip()
     lower = raw_text.lower()
 
+    # Голосовое/аудио владельца в служебном чате: распознаём речь (STT) и
+    # ПРОДОЛЖАЕМ обработку этого же сообщения как обычного текста — единый
+    # пайплайн команд/намерений ниже, без отдельного диспетчера для голоса.
+    if message.chat.id == service_chat_id and (message.voice or message.audio):
+        media_path, media_mime = await _download_media(message)
+        transcribed: Optional[str] = None
+        try:
+            if media_path is None:
+                await client.send_message(
+                    service_chat_id, "⚠️ Не удалось скачать голосовое сообщение. Попробуйте ещё раз."
+                )
+                return
+            try:
+                transcribed = await transcribe_voice(media_path, media_mime)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ошибка распознавания голосового сообщения: %s", exc)
+                await notify_owner(f"⚠️ Не удалось распознать голосовое сообщение: {exc}")
+                return
+        finally:
+            _cleanup_temp_file(media_path)
+        if not transcribed:
+            await client.send_message(
+                service_chat_id, "⚠️ Не удалось распознать голосовое сообщение. Попробуйте ещё раз."
+            )
+            return
+        raw_text = transcribed
+        lower = raw_text.lower()
+
     # Анализ фото владельца в служебном чате: фото с подписью (любой), либо
     # ответ на сообщение с фото ("что это?", "опиши" и т.п.) — Gemini vision
     # через уже существующую мультимодальную логику (services.ai_service).
@@ -544,30 +573,6 @@ async def _handle_incoming(message: Message) -> None:
                 "msg_id": preview_msg_id,
                 "chat_id": chat_id,
             }
-        finally:
-            _cleanup_temp_file(media_path)
-        return
-
-    # Голосовое/аудио владельца в служебном чате, не подошедшее ни под черновик,
-    # ни под прямую отправку — распознаём и отвечаем (Gemini audio).
-    if message.chat.id == service_chat_id and (message.voice or message.audio):
-        media_path, media_mime = await _download_media(message)
-        try:
-            if media_path is None:
-                await client.send_message(
-                    service_chat_id, "⚠️ Не удалось скачать голосовое сообщение. Попробуйте ещё раз."
-                )
-                return
-            try:
-                reply_text = await analyze_voice(raw_text, media_path, media_mime)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Ошибка распознавания голосового сообщения: %s", exc)
-                await notify_owner(f"⚠️ Не удалось обработать голосовое сообщение: {exc}")
-                return
-            await client.send_message(
-                service_chat_id,
-                reply_text or "⚠️ Не удалось распознать голосовое сообщение. Попробуйте ещё раз.",
-            )
         finally:
             _cleanup_temp_file(media_path)
         return
@@ -1435,6 +1440,24 @@ async def _bot_handle_message(
     reply_to = msg.get("reply_to_message") or {}
     bot_msg_id = reply_to.get("message_id")
 
+    # Голосовое/аудио владельца: распознаём речь (STT) и ПРОДОЛЖАЕМ обработку
+    # этого же сообщения как обычного текста — единый пайплайн команд/намерений
+    # ниже, без отдельного диспетчера для голоса. Временный файл текущего
+    # сообщения удаляет crash-guard bot_api.py.
+    if media_path and media_mime and "audio" in media_mime:
+        try:
+            transcribed = await transcribe_voice(media_path, media_mime)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка распознавания голосового сообщения: %s", exc)
+            await notify_owner(f"⚠️ Не удалось распознать голосовое сообщение: {exc}")
+            return
+        if not transcribed:
+            await bot_api.send_message(
+                owner_id, "⚠️ Не удалось распознать голосовое сообщение. Попробуйте ещё раз."
+            )
+            return
+        text = transcribed
+
     # Анализ фото владельца: текущее фото с любой подписью, либо ответ на
     # сообщение с фото ("что это?", "опиши" и т.п.) — Gemini vision через уже
     # существующую мультимодальную логику (services.ai_service).
@@ -1649,20 +1672,11 @@ async def _bot_handle_message(
         await _handle_delete_intent(del_intent)
         return
 
-    # Голосовое/аудио владельца, не подошедшее ни под черновик, ни под прямую
-    # отправку — распознаём и отвечаем (Gemini audio). Временный файл текущего
-    # сообщения удаляет crash-guard bot_api.py.
-    if media_path and media_mime and "audio" in media_mime:
-        try:
-            reply_text = await analyze_voice(text, media_path, media_mime)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Ошибка распознавания голосового сообщения: %s", exc)
-            await notify_owner(f"⚠️ Не удалось обработать голосовое сообщение: {exc}")
-            return
-        await bot_api.send_message(
-            owner_id,
-            reply_text or "⚠️ Не удалось распознать голосовое сообщение. Попробуйте ещё раз.",
-        )
+    # Генерация текста без явного получателя (аналог /con), в т.ч. по голосу:
+    # «Придумай отмазку…», «Поздравь маму с ДР» и т.п. — переиспользуем
+    # существующий handle_con_command вместо дублирования LLM-логики.
+    if detect_content_intent(text):
+        await handle_con_command(text)
         return
 
     if not text or not bot_msg_id:

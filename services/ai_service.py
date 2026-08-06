@@ -697,6 +697,30 @@ async def analyze_photo(question: str, media_path: str, media_mime: str) -> Opti
     return raw
 
 
+_VOICE_ANALYSIS_SYSTEM_PROMPT = (
+    "Ты — ассистент, который распознаёт речь в голосовых/аудио сообщениях. "
+    "Если это вопрос или просьба — ответь по существу; если это просто "
+    "диктовка — приведи распознанный текст. Отвечай на русском языке, "
+    "без лишних вступлений."
+)
+
+
+async def analyze_voice(question: str, media_path: str, media_mime: str) -> Optional[str]:
+    """Распознаёт голосовое/аудио сообщение и отвечает по нему (Gemini audio;
+    Groq-фоллбек аудио не слышит).
+
+    question — сопроводительный текст/подпись владельца (может быть пустым);
+    media_path/media_mime — путь к скачанному аудио и его MIME.
+    """
+    user_prompt = question.strip() or "Распознай и обработай голосовое сообщение."
+    raw = await _generate_with_fallback(
+        _VOICE_ANALYSIS_SYSTEM_PROMPT, user_prompt, media_path=media_path, media_mime=media_mime
+    )
+    if raw:
+        shared.logger.info("Голосовое сообщение обработано: %s", raw[:80])
+    return raw
+
+
 async def generate_content(instruction: str) -> list[str]:
     """Генерация 3 готовых текстов по произвольному запросу (команда /con)."""
     raw = await _generate_with_fallback(

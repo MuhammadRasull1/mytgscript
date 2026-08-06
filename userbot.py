@@ -82,6 +82,7 @@ from services.ai_service import (
     _dialog_history_block,
     _push_dialog,
     analyze_photo,
+    analyze_voice,
     detect_direct_send_intent,
     detect_delete_intent,
     generate_direct_send_text,
@@ -145,6 +146,19 @@ class Config:
             bot_token=os.getenv("BOT_TOKEN") or None,
             owner_id=_parse_owner_id(),
         )
+
+
+# Человекочитаемые названия режимов для сообщений пользователю (без "bot_chat"
+# и прочих внутренних идентификаторов с подчёркиванием).
+AI_MODE_LABELS = {
+    "bot_chat": "Личный чат",
+    "userbot": "Юзербот",
+    "bot": "Только лог",
+}
+
+
+def _ai_mode_label() -> str:
+    return AI_MODE_LABELS.get(CFG.ai_mode, CFG.ai_mode)
 
 
 def _parse_owner_id() -> Optional[int]:
@@ -533,6 +547,31 @@ async def _handle_incoming(message: Message) -> None:
         finally:
             _cleanup_temp_file(media_path)
         return
+
+    # Голосовое/аудио владельца в служебном чате, не подошедшее ни под черновик,
+    # ни под прямую отправку — распознаём и отвечаем (Gemini audio).
+    if message.chat.id == service_chat_id and (message.voice or message.audio):
+        media_path, media_mime = await _download_media(message)
+        try:
+            if media_path is None:
+                await client.send_message(
+                    service_chat_id, "⚠️ Не удалось скачать голосовое сообщение. Попробуйте ещё раз."
+                )
+                return
+            try:
+                reply_text = await analyze_voice(raw_text, media_path, media_mime)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ошибка распознавания голосового сообщения: %s", exc)
+                await notify_owner(f"⚠️ Не удалось обработать голосовое сообщение: {exc}")
+                return
+            await client.send_message(
+                service_chat_id,
+                reply_text or "⚠️ Не удалось распознать голосовое сообщение. Попробуйте ещё раз.",
+            )
+        finally:
+            _cleanup_temp_file(media_path)
+        return
+
     if message.chat.id == service_chat_id:
         return  # не обрабатываем собственный служебный чат
     # В режиме bot_chat игнорируем сообщения управляющего бота: иначе его кнопки
@@ -1610,6 +1649,22 @@ async def _bot_handle_message(
         await _handle_delete_intent(del_intent)
         return
 
+    # Голосовое/аудио владельца, не подошедшее ни под черновик, ни под прямую
+    # отправку — распознаём и отвечаем (Gemini audio). Временный файл текущего
+    # сообщения удаляет crash-guard bot_api.py.
+    if media_path and media_mime and "audio" in media_mime:
+        try:
+            reply_text = await analyze_voice(text, media_path, media_mime)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка распознавания голосового сообщения: %s", exc)
+            await notify_owner(f"⚠️ Не удалось обработать голосовое сообщение: {exc}")
+            return
+        await bot_api.send_message(
+            owner_id,
+            reply_text or "⚠️ Не удалось распознать голосовое сообщение. Попробуйте ещё раз.",
+        )
+        return
+
     if not text or not bot_msg_id:
         return  # простое сообщение без ответа — игнорируем
 
@@ -1766,7 +1821,7 @@ async def main() -> None:
             logger.warning("Не удалось сбросить вебхук бота: %s", exc)
         await bot_api.send_message(
             owner_id,
-            "🤖 AI-автоответчик запущен (режим: bot_chat). Слушаю входящие ЛС…",
+            f"🤖 AI-автоответчик активен\nРежим: {_ai_mode_label()}\nСлушаю входящие сообщения…",
         )
         poller = BotApiPoller(bot_api, bot_handle_update)
         poller_task = asyncio.create_task(poller.run())
@@ -1774,7 +1829,7 @@ async def main() -> None:
     else:
         await client.send_message(
             service_chat_id,
-            f"🤖 AI-автоответчик запущен (режим: {CFG.ai_mode}). Слушаю входящие ЛС…",
+            f"🤖 AI-автоответчик активен\nРежим: {_ai_mode_label()}\nСлушаю входящие ЛС…",
         )
 
     try:
